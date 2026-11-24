@@ -619,7 +619,7 @@ systemctl restart ` + xray.ServiceName
 
 	// A service that starts and dies a second later is "active" if asked at
 	// once. Wait out the first restart interval before believing it.
-	state, err := s.sudo(ctx, run, "sleep 4; systemctl is-active "+xray.ServiceName+" || true")
+	state, err := s.sudo(ctx, run, sshx.ServiceSettled(xray.ServiceName, settleSeconds))
 	if err != nil {
 		return err
 	}

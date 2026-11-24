@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -243,6 +244,7 @@ func runServe(args []string) error {
 		Servers: serverStore, Store: trafficStore, Query: installer.TrafficCounters,
 		Busy: manager.Busy, Interval: *trafficInterval, Log: logger,
 	}
+	installer.RecordTraffic = collector.Record
 	alertStore := alerts.NewStore(db, box)
 	notifier := &alerts.Notifier{
 		Store: alertStore, Servers: serverStore, State: probeStore.StateOf,
@@ -338,14 +340,25 @@ func runServe(args []string) error {
 		return err
 	}
 
-	go pruneLoop(ctx, authService, eventStore, manager, logger)
+	// What runs alongside the server for as long as the panel does. Counted,
+	// so that on the way out the database is not closed under a round that is
+	// still writing to it.
+	var background sync.WaitGroup
+	alongside := func(run func()) {
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			run()
+		}()
+	}
+	alongside(func() { pruneLoop(ctx, authService, eventStore, manager, logger) })
 	// Checks stop with the panel, not with a request: same lifetime as jobs.
-	go prober.Run(jobsCtx)
-	go sweeper.Run(jobsCtx)
-	go collector.Run(jobsCtx)
-	go notifier.Run(jobsCtx)
-	go deviceManager.Run(jobsCtx, time.Minute)
-	go localClient.Run(jobsCtx)
+	alongside(func() { prober.Run(jobsCtx) })
+	alongside(func() { sweeper.Run(jobsCtx) })
+	alongside(func() { collector.Run(jobsCtx) })
+	alongside(func() { notifier.Run(jobsCtx) })
+	alongside(func() { deviceManager.Run(jobsCtx, time.Minute) })
+	alongside(func() { localClient.Run(jobsCtx) })
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
@@ -355,17 +368,38 @@ func runServe(args []string) error {
 		return err
 	case <-ctx.Done():
 	}
+	// From here a second Ctrl-C, or a second SIGTERM, ends the process the
+	// ordinary way: whoever asks twice does not want to wait.
+	stop()
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err = server.Shutdown(shutdownCtx)
 	// Stop running jobs and let them record where they stopped, so they can be
-	// retried after the restart.
+	// retried after the restart. The rounds first: one of them may be about to
+	// start a job, and a job is waited for only once nothing can start one.
 	stopJobs()
-	manager.Wait()
-	deviceManager.Wait()
+	finished := make(chan struct{})
+	go func() {
+		background.Wait()
+		manager.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(shutdownGrace):
+		// A job putting a server back the way it was is given its time, but
+		// not for ever: whatever supervises the panel would kill it anyway,
+		// and without a word.
+		logger.Warn("background work is still running; exiting without waiting for it any longer")
+	}
 	return err
 }
+
+// shutdownGrace is how long the panel waits for jobs and rounds to stop. A
+// restore after a failed apply or update — which is not cut short — takes up
+// to a minute.
+const shutdownGrace = 75 * time.Second
 
 // recoverServers puts servers whose job died with the previous process into
 // the state that job's record now shows.

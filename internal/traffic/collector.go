@@ -81,6 +81,24 @@ func (c *Collector) RunOnce(ctx context.Context) {
 	}
 }
 
+// Record stores counters that were read outside a round: the installer reads
+// them one last time right before it restarts a server's Xray, since they do
+// not outlive it. What cannot be read is logged and left.
+func (c *Collector) Record(ctx context.Context, serverID int64, raw string) {
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	counters, err := ParseStats(raw, xray.InboundTag)
+	if err != nil {
+		c.Log.Warn("unreadable traffic counters before a restart", "server", serverID, "err", err)
+		return
+	}
+	if err := c.Store.Record(ctx, serverID, counters, now()); err != nil && ctx.Err() == nil {
+		c.Log.Warn("could not store traffic before a restart", "server", serverID, "err", err)
+	}
+}
+
 // parallel is how many servers are asked at once.
 const parallel = 8
 

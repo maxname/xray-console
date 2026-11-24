@@ -543,3 +543,45 @@ func TestSOCKSConnectSignsInWhenTheProxyAsks(t *testing.T) {
 		t.Fatal("a host name that does not fit in the request was sent anyway")
 	}
 }
+
+func TestCountersAreReadBeforeXrayIsRestarted(t *testing.T) {
+	u := newUnit(t)
+	const counters = `{"stat":[{"name":"inbound>>>in>>>traffic>>>uplink","value":42}]}`
+	var recorded []string
+	u.installer.RecordTraffic = func(_ context.Context, serverID int64, raw string) {
+		if serverID == u.srv.ID {
+			recorded = append(recorded, raw)
+		}
+	}
+	u.server.respond = func(script string) (string, error, bool) {
+		if strings.Contains(script, "api statsquery") {
+			return counters, nil, true
+		}
+		return "", nil, false
+	}
+	u.apply()
+	// They live in Xray's memory: after the restart there is nothing to read.
+	read, asked := u.server.did("api statsquery")
+	swap, _ := u.server.did("mv -f " + candidatePath)
+	if !asked || read > swap {
+		t.Fatalf("the counters were not read before the swap and restart: %q", u.server.ran)
+	}
+	if len(recorded) != 1 || recorded[0] != counters {
+		t.Fatalf("recorded %q", recorded)
+	}
+
+	// A server that cannot answer — its configuration predates the counters —
+	// is restarted all the same.
+	u = newUnit(t)
+	u.installer.RecordTraffic = func(context.Context, int64, string) { t.Error("recorded an answer that was never given") }
+	u.server.respond = func(script string) (string, error, bool) {
+		if strings.Contains(script, "api statsquery") {
+			return "", refuse("failed to dial 127.0.0.1:10085"), true
+		}
+		return "", nil, false
+	}
+	u.apply()
+	if _, swapped := u.server.did("mv -f " + candidatePath); !swapped {
+		t.Fatal("an apply was held up by counters that could not be read")
+	}
+}

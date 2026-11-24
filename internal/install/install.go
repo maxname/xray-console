@@ -102,6 +102,9 @@ type Installer struct {
 	Planner Planner
 	// Events receives what happened, for the overview's feed. May be nil.
 	Events *events.Store
+	// RecordTraffic is given a server's traffic counters, as Xray answered
+	// with them, right before the panel restarts that Xray. May be nil.
+	RecordTraffic func(ctx context.Context, serverID int64, raw string)
 	// ForgetChecks, when set, is told that a server's availability history no
 	// longer describes it: it was just installed, or just rolled back.
 	ForgetChecks func(ctx context.Context, serverID int64) error
@@ -451,6 +454,32 @@ func logCommand(run *ops.Run, script string) {
 		run.Cmd(strings.TrimSpace(line))
 	}
 }
+
+// flushTraffic reads the server's traffic counters one last time before Xray
+// is restarted. They live in Xray's memory and start from zero with it: what
+// passed since the panel last read them would otherwise be gone — up to a
+// whole interval of it, on every apply and every update.
+func (s *session) flushTraffic(ctx context.Context) {
+	if s.inst.RecordTraffic == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	raw, err := s.quietSudo(ctx, statsQuery)
+	if err != nil {
+		// A configuration from before the panel counted traffic has nobody
+		// to ask; a restart is not held up for a number.
+		return
+	}
+	s.inst.RecordTraffic(ctx, s.serverID, raw)
+}
+
+// settleSeconds is how long Xray has to stay up, as the same process, to be
+// called running after a restart. A crash on start-up shows well within it.
+const settleSeconds = 3
+
+// statsQuery asks a server's Xray for its traffic counters.
+const statsQuery = xray.BinaryPath + " api statsquery --server=" + xray.APIListen
 
 // versionCheck is a script that proves the binary at path runs on this server
 // and prints the first line of what it says about itself. The binary is run on

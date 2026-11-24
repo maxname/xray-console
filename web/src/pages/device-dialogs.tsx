@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next'
 import { Field, Notice } from '@/components/auth-layout'
 import { ConfirmStrip } from '@/components/confirm-strip'
 import { FailureExplained } from '@/components/failure-explained'
+import { HostKeyCheck } from '@/components/host-key-check'
 import { CopyBlock } from '@/components/install-fields'
 import { LogView, StepList } from '@/components/operation-view'
 import { Button } from '@/components/ui/button'
@@ -31,12 +32,12 @@ import {
   ApiError,
   type Device,
   type DeviceSettings,
-  type HostKeyProbe,
   type OperationFeed,
   type RuleSet,
 } from '@/lib/api'
 import { devicesKey } from '@/lib/rules'
 import { explained } from '@/lib/failures'
+import { useHostKeyCheck } from '@/lib/host-key'
 import { toast } from '@/lib/toast'
 
 import { explain, useDevicesCache, OWN_ERRORS } from '@/lib/devices'
@@ -156,16 +157,7 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
     proxy_auth: false,
     auto_push: true,
   })
-  const [probe, setProbe] = useState<HostKeyProbe | null>(null)
-  const [confirmed, setConfirmed] = useState(false)
-
-  const fetchKey = useMutation({
-    mutationFn: () => api.probeServer(host.trim(), Number(port)),
-    onSuccess: (result) => {
-      setProbe(result)
-      setConfirmed(false)
-    },
-  })
+  const hostKey = useHostKeyCheck(host, port)
   const create = useMutation({
     mutationFn: () =>
       api.createDevice({
@@ -174,7 +166,7 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
         host: host.trim(),
         ssh_port: Number(port),
         ssh_user: user.trim(),
-        host_key: probe?.host_key ?? '',
+        host_key: hostKey.hostKey,
         password,
       }),
     onSuccess: (next) => {
@@ -182,23 +174,19 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
       onClose()
     },
   })
-  // A different address is a different machine: its key has to be seen anew.
-  const retarget = (change: () => void) => {
-    change()
-    setProbe(null)
-    setConfirmed(false)
-    fetchKey.reset()
-  }
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     create.mutate()
   }
-  const probeFailed =
-    fetchKey.error instanceof ApiError && fetchKey.error.code === 'ssh_unreachable'
-      ? t('devices.new.unreachable')
-      : fetchKey.isError
-        ? explain(t, fetchKey.error)
-        : null
+  const probeFailure =
+    hostKey.error === null
+      ? null
+      : {
+          title:
+            hostKey.error instanceof ApiError && hostKey.error.code === 'ssh_unreachable'
+              ? t('devices.new.unreachable')
+              : explain(t, hostKey.error),
+        }
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -231,7 +219,7 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
                 required
                 placeholder="192.168.1.1"
                 value={host}
-                onChange={(event) => retarget(() => setHost(event.target.value))}
+                onChange={(event) => setHost(event.target.value)}
               />
             </Field>
             <Field>
@@ -242,7 +230,7 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
                 className="tabular-nums"
                 required
                 value={port}
-                onChange={(event) => retarget(() => setPort(event.target.value))}
+                onChange={(event) => setPort(event.target.value)}
               />
             </Field>
             <Field>
@@ -259,39 +247,12 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
             </Field>
           </div>
 
-          <div className="flex flex-col gap-2 rounded-lg border p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="font-medium">{t('devices.new.fingerprint')}</span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={host.trim() === '' || port.trim() === '' || fetchKey.isPending}
-                onClick={() => fetchKey.mutate()}
-              >
-                {fetchKey.isPending ? t('serverNew.fingerprint.fetching') : t('serverNew.fingerprint.fetch')}
-              </Button>
-            </div>
-            {probe === null ? (
-              <span className="text-xs text-muted-foreground">{t('devices.new.fingerprintPrompt')}</span>
-            ) : (
-              <>
-                <code className="font-mono text-xs break-all" translate="no">
-                  {probe.fingerprint} · {probe.type}
-                </code>
-                <label className="inline-flex cursor-pointer items-center gap-2">
-                  <input
-                    type="checkbox"
-                    className="size-4 accent-primary"
-                    checked={confirmed}
-                    onChange={(event) => setConfirmed(event.target.checked)}
-                  />
-                  <span>{t('serverNew.fingerprint.confirm')}</span>
-                </label>
-              </>
-            )}
-            {probeFailed !== null && <Notice title={probeFailed} />}
-          </div>
+          <HostKeyCheck
+            check={hostKey}
+            title={t('devices.new.fingerprint')}
+            prompt={t('devices.new.fingerprintPrompt')}
+            failure={probeFailure}
+          />
 
           <Field hint={t('devices.new.passwordHint')}>
             <Label htmlFor="device-password">{t('devices.new.password', { user })}</Label>
@@ -316,7 +277,7 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
             <Button type="button" variant="outline" onClick={onClose}>
               {t('common.cancel')}
             </Button>
-            <Button type="submit" disabled={probe === null || !confirmed || create.isPending}>
+            <Button type="submit" disabled={!hostKey.ready || create.isPending}>
               {create.isPending ? t('devices.new.starting') : t('devices.new.submit')}
             </Button>
           </DialogFooter>

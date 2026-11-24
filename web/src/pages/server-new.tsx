@@ -4,12 +4,14 @@ import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
+import { HostKeyCheck } from '@/components/host-key-check'
 import { AccessFields, MaskField, TemplateField } from '@/components/install-fields'
 import { Page, PageHeader, Panel } from '@/components/page'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { api, ApiError, type HostKeyProbe } from '@/lib/api'
+import { api, ApiError } from '@/lib/api'
+import { useHostKeyCheck } from '@/lib/host-key'
 import {
   initialInstallForm,
   isKnownFormError,
@@ -27,24 +29,7 @@ export function ServerNewPage() {
   const [port, setPort] = useState('22')
   const [user, setUser] = useState('root')
   const [install, setInstall] = useState(initialInstallForm)
-  // The key the server presented, and whether the administrator vouched for it.
-  const [probe, setProbe] = useState<HostKeyProbe | null>(null)
-  const [confirmed, setConfirmed] = useState(false)
-
-  const probeMutation = useMutation({
-    mutationFn: () => api.probeServer(host.trim(), Number(port)),
-    onSuccess: (result) => {
-      setProbe(result)
-      setConfirmed(false)
-    },
-  })
-
-  // A fingerprint belongs to one address: change the address and it is void.
-  const resetProbe = () => {
-    setProbe(null)
-    setConfirmed(false)
-    probeMutation.reset()
-  }
+  const hostKey = useHostKeyCheck(host, port)
 
   const createMutation = useMutation({
     mutationFn: () =>
@@ -54,7 +39,7 @@ export function ServerNewPage() {
         host: host.trim(),
         ssh_port: Number(port),
         ssh_user: user.trim(),
-        host_key: probe?.host_key ?? '',
+        host_key: hostKey.hostKey,
         ...toInstallOptions(install),
       }),
     onSuccess: ({ server }) => {
@@ -82,11 +67,11 @@ export function ServerNewPage() {
     return t('common.error')
   })()
 
-  const probeError = (() => {
-    if (!probeMutation.isError) {
+  const probeFailure = (() => {
+    const error = hostKey.error
+    if (error === null) {
       return null
     }
-    const error = probeMutation.error
     if (error instanceof ApiError && error.code === 'ssh_unreachable') {
       return {
         title: t('serverNew.fingerprint.unreachableTitle'),
@@ -94,13 +79,12 @@ export function ServerNewPage() {
       }
     }
     if (error instanceof ApiError && isKnownFormError(error.code)) {
-      return { title: t(`serverNew.errors.${error.code}`), text: undefined }
+      return { title: t(`serverNew.errors.${error.code}`) }
     }
-    return { title: t('common.error'), text: undefined }
+    return { title: t('common.error') }
   })()
 
-  const canProbe = host.trim() !== '' && port.trim() !== ''
-  const canSubmit = probe !== null && confirmed && !createMutation.isPending
+  const canSubmit = hostKey.ready && !createMutation.isPending
 
   return (
     <Page>
@@ -156,10 +140,7 @@ export function ServerNewPage() {
                 autoCapitalize="off"
                 required
                 value={host}
-                onChange={(event) => {
-                  setHost(event.target.value)
-                  resetProbe()
-                }}
+                onChange={(event) => setHost(event.target.value)}
               />
             </Field>
             <Field>
@@ -170,10 +151,7 @@ export function ServerNewPage() {
                 inputMode="numeric"
                 required
                 value={port}
-                onChange={(event) => {
-                  setPort(event.target.value)
-                  resetProbe()
-                }}
+                onChange={(event) => setPort(event.target.value)}
               />
             </Field>
             <Field>
@@ -191,49 +169,13 @@ export function ServerNewPage() {
             </Field>
           </div>
 
-          {/* Before any password: which machine is this, really? */}
-          <div className="flex flex-col gap-2 rounded-lg border p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="font-medium">{t('serverNew.fingerprint.title')}</span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!canProbe || probeMutation.isPending}
-                onClick={() => probeMutation.mutate()}
-              >
-                {probeMutation.isPending
-                  ? t('serverNew.fingerprint.fetching')
-                  : t('serverNew.fingerprint.fetch')}
-              </Button>
-            </div>
-            {probe === null ? (
-              <span className="text-xs text-muted-foreground">
-                {t('serverNew.fingerprint.prompt')}
-              </span>
-            ) : (
-              <>
-                <code className="font-mono text-[13px] break-all" translate="no">
-                  {probe.fingerprint} · {probe.type}
-                </code>
-                <span className="text-xs text-muted-foreground">
-                  {t('serverNew.fingerprint.hint')}
-                </span>
-                <label className="inline-flex min-h-8 cursor-pointer items-center gap-2">
-                  <input
-                    type="checkbox"
-                    className="size-4 accent-primary"
-                    checked={confirmed}
-                    onChange={(event) => setConfirmed(event.target.checked)}
-                  />
-                  <span>{t('serverNew.fingerprint.confirm')}</span>
-                </label>
-              </>
-            )}
-            {probeError !== null && (
-              <Notice title={probeError.title}>{probeError.text}</Notice>
-            )}
-          </div>
+          <HostKeyCheck
+            check={hostKey}
+            title={t('serverNew.fingerprint.title')}
+            prompt={t('serverNew.fingerprint.prompt')}
+            hint={t('serverNew.fingerprint.hint')}
+            failure={probeFailure}
+          />
 
           <AccessFields value={install} onChange={setInstall} user={user.trim()} />
         </Panel>

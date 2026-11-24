@@ -219,6 +219,10 @@ yet), a list of commands to finish a removal by hand.
   it shows is all new. "Up" is from clients to the server, "down" from the
   server to clients. A server's traffic is its inbound's, which includes
   chain traffic passing through; a subscription's is its user's.
+- Before the panel restarts Xray itself — an apply, an update, a restart
+  asked for — it reads the counters one more time
+  (`Installer.RecordTraffic`), so what was gained since the last round is
+  kept. A restart the panel did not make still loses up to one interval.
 - Latency and loss on the statistics page come from the availability checks
   already kept (`probe.Store.Latency`: medians and the 95th percentile by
   position in the sorted column); outages from the `server_up` events, which
@@ -472,3 +476,15 @@ importing other SSH keys.
   problem.
 - An operation's `finish` runs before its server is released (`ops`): until
   then nothing else may start there.
+- Whether a service stayed up after a restart is asked with
+  `sshx.ServiceSettled`: active, and the same process as before the wait. A
+  bare `sleep N; systemctl is-active` takes a service that systemd keeps
+  starting again for one that runs.
+- On the way out the panel stops answering, then stops the background rounds
+  and the jobs and waits for them (`shutdownGrace`) before the database is
+  closed. A loop started in `main` goes through `alongside`, or it is not
+  waited for.
+- A form that takes a machine's address shows its SSH key first:
+  `useHostKeyCheck` (`lib/host-key.ts`) and `HostKeyCheck`
+  (`components/`). What was fetched and confirmed is remembered with the
+  address it was for, so the inputs do not have to reset anything.

@@ -678,8 +678,7 @@ mv -f ` + candidatePath + ` ` + ConfigPath + `
 systemctl daemon-reload
 systemctl enable ` + ServiceName + `
 systemctl restart ` + ServiceName + `
-sleep 3
-systemctl is-active ` + ServiceName + ` || true`
+` + sshx.ServiceSettled(ServiceName, 3)
 	out, err := j.sudo(ctx, swap)
 	if err != nil {
 		return err
@@ -712,8 +711,7 @@ func (j *job) restore(ctx context.Context) bool {
 	restore := `if [ -f ` + previousPath + ` ]; then
 cp -p ` + previousPath + ` ` + ConfigPath + `
 systemctl restart ` + ServiceName + `
-sleep 3
-systemctl is-active ` + ServiceName + ` || true
+` + sshx.ServiceSettled(ServiceName, 3) + `
 else
 systemctl stop ` + ServiceName + `
 echo none

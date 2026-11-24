@@ -13,6 +13,7 @@ import (
 	"xray-console/internal/ops"
 	"xray-console/internal/plan"
 	"xray-console/internal/servers"
+	"xray-console/internal/sshx"
 	"xray-console/internal/xray"
 )
 
@@ -125,6 +126,7 @@ func (s *session) applyStage(ctx context.Context, run *ops.Run) error {
 }
 
 func (s *session) applySwap(ctx context.Context, run *ops.Run) error {
+	s.flushTraffic(ctx)
 	s.backup = fmt.Sprintf("%s/config-%d.json", BackupDir, s.inst.now().Unix())
 	// set -e: without the copy there is nothing to go back to, and a file
 	// that did not move must not be followed by a restart that looks fine.
@@ -138,7 +140,7 @@ systemctl restart ` + xray.ServiceName
 	}
 
 	// As at install: give a crash loop time to show itself.
-	state, err := s.sudo(ctx, run, "sleep 3; systemctl is-active "+xray.ServiceName+" || true")
+	state, err := s.sudo(ctx, run, sshx.ServiceSettled(xray.ServiceName, settleSeconds))
 	if err != nil {
 		return withRestored(err, s.restore(ctx, run))
 	}
@@ -426,7 +428,8 @@ func (i *Installer) Restart(ctx context.Context, serverID int64) (string, error)
 	}
 	s := &session{inst: i, serverID: serverID}
 	defer s.close()
-	state, err := s.quietSudo(ctx, "systemctl restart "+xray.ServiceName+"; sleep 2; systemctl is-active "+xray.ServiceName+" || true")
+	s.flushTraffic(ctx)
+	state, err := s.quietSudo(ctx, "systemctl restart "+xray.ServiceName+"\n"+sshx.ServiceSettled(xray.ServiceName, settleSeconds))
 	return strings.TrimSpace(state), err
 }
 
@@ -480,7 +483,7 @@ func (i *Installer) EnsureUser(ctx context.Context, serverID int64, userID strin
 func (i *Installer) TrafficCounters(ctx context.Context, serverID int64) (string, error) {
 	s := &session{inst: i, serverID: serverID}
 	defer s.close()
-	return s.quietSudo(ctx, xray.BinaryPath+" api statsquery --server="+xray.APIListen)
+	return s.quietSudo(ctx, statsQuery)
 }
 
 // Journal returns the last lines of Xray's log on a server.

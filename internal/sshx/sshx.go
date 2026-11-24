@@ -342,6 +342,27 @@ func Quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// ServiceSettled is a script that waits the given seconds and prints how a
+// systemd service stands: "active" only if it is running and it is the same
+// process that was running when the wait began.
+//
+// "Is it active" alone is not the question. A service that crashes is
+// started again by systemd, and one that crashes every time is, at any given
+// moment, quite likely to be found between two crashes — active. What tells
+// a service that came up from one that keeps being brought up is whether the
+// process that was there is still the one there: a different one, or none at
+// the start, reads as "restarting".
+func ServiceSettled(unit string, seconds int) string {
+	u := Quote(unit)
+	return `pid=$(systemctl show -p MainPID --value ` + u + `)
+sleep ` + strconv.Itoa(seconds) + `
+state=$(systemctl is-active ` + u + ` || true)
+if [ "$state" = active ]; then
+  if [ "$pid" = 0 ] || [ "$(systemctl show -p MainPID --value ` + u + `)" != "$pid" ]; then state=restarting; fi
+fi
+echo "$state"`
+}
+
 // InstallAuthorizedKey is a script, for the login user, that puts the panel's
 // key into ~/.ssh/authorized_keys. line is the key as it is looked for,
 // publicKey the line as it is added; run twice it adds nothing the second

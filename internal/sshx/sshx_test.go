@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -258,5 +259,52 @@ func TestDialKeepsWatchOverTheConnection(t *testing.T) {
 	defer client.Close()
 	if client.closed == nil {
 		t.Fatal("a dialled connection has no keepalive")
+	}
+}
+
+// settled runs the script against a stand-in for systemctl that reports the
+// given state, and the given process ids before and after the wait.
+func settled(t *testing.T, state, pidBefore, pidAfter string) string {
+	t.Helper()
+	dir := t.TempDir()
+	// The first "show" answers with the process at the start, later ones with
+	// the process at the end.
+	stub := `#!/bin/sh
+case "$1" in
+show)
+  if [ -e "` + dir + `/asked" ]; then echo "` + pidAfter + `"; else echo "` + pidBefore + `"; : > "` + dir + `/asked"; fi ;;
+is-active)
+  echo "` + state + `"; [ "` + state + `" = active ] ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", ServiceSettled("xray.service", 0))
+	cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin"}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("the script failed: %v: %s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestAServiceIsRunningOnlyIfTheSameProcessStayedUp(t *testing.T) {
+	for _, c := range []struct {
+		what, state, before, after, want string
+	}{
+		{"came up and stayed", "active", "4120", "4120", "active"},
+		// Crashed and was started again by systemd during the wait: found
+		// between two crashes, it is "active" — and a different process.
+		{"another process by the end", "active", "4120", "4188", "restarting"},
+		// Already between two attempts when the wait began.
+		{"no process at the start", "active", "0", "4188", "restarting"},
+		{"being restarted at the end", "activating", "4120", "0", "activating"},
+		{"gave up", "failed", "4120", "0", "failed"},
+		{"not running", "inactive", "0", "0", "inactive"},
+	} {
+		if got := settled(t, c.state, c.before, c.after); got != c.want {
+			t.Errorf("%s: %q, want %q", c.what, got, c.want)
+		}
 	}
 }

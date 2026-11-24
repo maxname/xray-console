@@ -177,6 +177,7 @@ func (s *session) updateFetch(ctx context.Context, run *ops.Run) error {
 // updateReplace keeps the running release aside, puts the new one in its
 // place and restarts Xray.
 func (s *session) updateReplace(ctx context.Context, run *ops.Run) error {
+	s.flushTraffic(ctx)
 	// mv, not cp, onto the binary: a running program's file cannot be written
 	// to, but it can be replaced.
 	// set -e: a release that was not set aside cannot be put back, and a
@@ -197,7 +198,7 @@ systemctl restart ` + xray.ServiceName
 	}
 
 	// As at install: give a crash loop time to show itself.
-	state, err := s.sudo(ctx, run, "sleep 3; systemctl is-active "+xray.ServiceName+" || true")
+	state, err := s.sudo(ctx, run, sshx.ServiceSettled(xray.ServiceName, settleSeconds))
 	if err != nil {
 		return withRestored(err, s.restoreRelease(ctx, run))
 	}
@@ -258,8 +259,7 @@ if [ -f ` + PrevDir + `/$f ]; then cp -p ` + PrevDir + `/$f ` + xray.AssetDir + 
 done
 rm -rf ` + nextDir + `
 systemctl restart ` + xray.ServiceName + `
-sleep 3
-systemctl is-active ` + xray.ServiceName
+` + sshx.ServiceSettled(xray.ServiceName, settleSeconds)
 	out, err := s.sudo(ctx, run, restore)
 	if err != nil || !strings.HasSuffix(strings.TrimSpace(out), "active") || strings.HasSuffix(strings.TrimSpace(out), "inactive") {
 		reason := strings.TrimSpace(out)

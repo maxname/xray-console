@@ -15,6 +15,7 @@ import (
 	"xray-console/internal/secrets"
 	"xray-console/internal/servers"
 	"xray-console/internal/store"
+	"xray-console/internal/xray"
 )
 
 const sample = `{
@@ -279,5 +280,44 @@ func TestAServerCannotFillTheHistoryWithCountersOfItsOwnMaking(t *testing.T) {
 		if len(counter.Name) > maxCounterName {
 			t.Fatalf("kept a name of %d characters", len(counter.Name))
 		}
+	}
+}
+
+func TestCountersReadBeforeARestartAreNotLost(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	srv := f.server("ams-1", "2")
+	at := time.Date(2026, 11, 23, 12, 30, 0, 0, time.Local)
+	collector := &Collector{
+		Store: f.store, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		now: func() time.Time { return at },
+	}
+	answer := func(up, down int64) string {
+		return fmt.Sprintf(`{"stat":[{"name":"inbound>>>%[1]s>>>traffic>>>uplink","value":%[2]d},
+			{"name":"inbound>>>%[1]s>>>traffic>>>downlink","value":"%[3]d"}]}`, xray.InboundTag, up, down)
+	}
+	total := func() Totals {
+		t.Helper()
+		by, err := f.store.ByServer(ctx, at.Add(-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return by[srv.ID]
+	}
+
+	// The last regular reading.
+	collector.Record(ctx, srv.ID, answer(100, 1000))
+	// Minutes of traffic later the panel is about to restart Xray, and reads
+	// the counters first: this is the part that used to vanish with them.
+	collector.Record(ctx, srv.ID, answer(180, 9000))
+	// Xray is back, counting from nothing.
+	collector.Record(ctx, srv.ID, answer(5, 40))
+	if got := total(); got != (Totals{185, 9040}) {
+		t.Fatalf("traffic across a restart: %+v, want {185 9040}", got)
+	}
+	// An answer that cannot be read changes nothing and breaks nothing.
+	collector.Record(ctx, srv.ID, "not json")
+	if got := total(); got != (Totals{185, 9040}) {
+		t.Fatalf("after an unreadable answer: %+v", got)
 	}
 }
