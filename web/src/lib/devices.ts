@@ -14,6 +14,7 @@ export const REFUSALS = [
   'bad_rule_set',
   'host_key_required',
   'busy',
+  'nothing_to_retry',
 ] as const
 
 export function explain(t: Translate, error: unknown): string {

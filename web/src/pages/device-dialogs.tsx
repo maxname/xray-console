@@ -1,10 +1,12 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
+import { ConfirmStrip } from '@/components/confirm-strip'
 import { FailureExplained } from '@/components/failure-explained'
 import { CopyBlock } from '@/components/install-fields'
+import { LogView, StepList } from '@/components/operation-view'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -30,6 +32,7 @@ import {
   type Device,
   type DeviceSettings,
   type HostKeyProbe,
+  type OperationFeed,
   type RuleSet,
 } from '@/lib/api'
 import { devicesKey } from '@/lib/rules'
@@ -323,6 +326,57 @@ export function NewDeviceDialog({ sets, onClose }: { sets: RuleSet[]; onClose: (
   )
 }
 
+/**
+ * The device's latest job, as the engine keeps it: its steps and what it
+ * printed. Asked again every second for as long as the job runs.
+ */
+function useDeviceJob(device: Device): OperationFeed | null {
+  const working = device.status === 'working'
+  const query = useQuery({
+    queryKey: ['operations', device.operation_id],
+    queryFn: () => api.getOperation(device.operation_id as number),
+    enabled: device.operation_id !== null,
+    // Until the record itself says the job is over: the device's own state
+    // may be a poll ahead of it, or behind.
+    refetchInterval: (q) =>
+      working || q.state.data?.operation.status === 'running' ? 1000 : false,
+  })
+  return device.operation_id === null ? null : (query.data ?? null)
+}
+
+/** The job's steps while it runs; afterwards steps and log, on request. */
+function DeviceJob({ device, job }: { device: Device; job: OperationFeed | null }) {
+  const { t } = useTranslation()
+  const working = device.status === 'working'
+  if (job === null) {
+    return working ? (
+      <div role="status" className="rounded-lg bg-muted px-3 py-2.5">
+        {t('devices.state.working')}…
+      </div>
+    ) : null
+  }
+  const title = t(`devices.jobs.${job.operation.kind}`, { defaultValue: t('devices.state.working') })
+  const steps = <StepList steps={job.operation.steps} label={title} names="devices.steps" />
+  if (working) {
+    return (
+      <div role="status" className="flex flex-col gap-3 rounded-lg bg-muted px-3 py-2.5">
+        <span className="font-medium">{title}</span>
+        {steps}
+      </div>
+    )
+  }
+  return (
+    <details>
+      <summary className="cursor-pointer text-primary">{t('devices.edit.job')}</summary>
+      <div className="mt-2 flex flex-col gap-3">
+        <span className="font-medium">{title}</span>
+        {steps}
+        <LogView lines={job.log} follow={false} />
+      </div>
+    </details>
+  )
+}
+
 export function DeviceFailure({ device }: { device: Device }) {
   const { t } = useTranslation()
   const failure = device.failure
@@ -377,7 +431,9 @@ export function DeviceDialog({
   })
   const [password, setPassword] = useState('')
   const [deleting, setDeleting] = useState(false)
+  const [undoing, setUndoing] = useState(false)
   const working = device.status === 'working'
+  const job = useDeviceJob(device)
 
   const save = useMutation({
     mutationFn: () => api.updateDevice(device.id, { ...settings, name: settings.name.trim() }),
@@ -390,6 +446,20 @@ export function DeviceDialog({
     mutationFn: () => api.setupDevice(device.id, password),
     onSuccess: (next) => {
       setPassword('')
+      update(next)
+    },
+  })
+  const retry = useMutation({
+    mutationFn: () => api.retryDevice(device.id, password),
+    onSuccess: (next) => {
+      setPassword('')
+      update(next)
+    },
+  })
+  const rollback = useMutation({
+    mutationFn: () => api.rollbackDevice(device.id),
+    onSuccess: (next) => {
+      setUndoing(false)
       update(next)
     },
   })
@@ -411,7 +481,12 @@ export function DeviceDialog({
       onClose()
     },
   })
-  const failure = save.error ?? setup.error ?? push.error ?? remove.error
+  const failure =
+    save.error ?? setup.error ?? retry.error ?? rollback.error ?? push.error ?? remove.error
+  const starting = setup.isPending || retry.isPending || rollback.isPending
+  // Only a set-up puts things on the device that can be taken off again; a
+  // push that fails puts the previous settings back by itself.
+  const canUndo = device.failure !== null && job?.operation.kind === 'device_setup'
   const needsPassword =
     device.failure?.code === 'ssh_password_required' || device.failure?.code === 'ssh_key_rejected'
 
@@ -436,14 +511,8 @@ export function DeviceDialog({
             </DialogDescription>
           </DialogHeader>
 
-          {working ? (
-            <div role="status" className="rounded-lg bg-muted px-3 py-2.5">
-              {t('devices.state.working')}
-              {device.step !== '' && `: ${t(`devices.steps.${device.step}`)}`}…
-            </div>
-          ) : (
-            <DeviceFailure device={device} />
-          )}
+          {!working && <DeviceFailure device={device} />}
+          <DeviceJob device={device} job={job} />
 
           <Field>
             <Label htmlFor="device-edit-name">{t('devices.fields.name')}</Label>
@@ -491,7 +560,7 @@ export function DeviceDialog({
             </div>
           )}
 
-          {device.status !== 'ready' && !working && (
+          {!working && (device.failure !== null || device.status !== 'ready') && (
             <div className="flex flex-col gap-2 rounded-lg border p-3">
               {needsPassword && (
                 <Field hint={t('devices.new.passwordHint')}>
@@ -507,29 +576,50 @@ export function DeviceDialog({
                   />
                 </Field>
               )}
-              <Button
-                type="button"
-                className="self-start"
-                disabled={setup.isPending}
-                onClick={() => setup.mutate()}
-              >
-                {t('devices.edit.retry')}
-              </Button>
-              <span className="text-xs text-muted-foreground">{t('devices.edit.retryHint')}</span>
+              <div className="flex flex-wrap gap-2">
+                {device.failure !== null && (
+                  <Button type="button" disabled={starting} onClick={() => retry.mutate()}>
+                    {t('devices.edit.retryStep', {
+                      step: t(`devices.steps.${device.step}`, { defaultValue: '' }),
+                    })}
+                  </Button>
+                )}
+                {device.status !== 'ready' && (
+                  <Button
+                    type="button"
+                    variant={device.failure === null ? 'default' : 'outline'}
+                    disabled={starting}
+                    onClick={() => setup.mutate()}
+                  >
+                    {device.failure === null ? t('devices.edit.setup') : t('devices.edit.retry')}
+                  </Button>
+                )}
+                {canUndo && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={starting}
+                    onClick={() => setUndoing(true)}
+                  >
+                    {t('devices.edit.rollback')}
+                  </Button>
+                )}
+              </div>
+              <span className="text-xs text-muted-foreground">
+                {device.failure !== null
+                  ? t('devices.edit.retryStepHint')
+                  : t('devices.edit.retryHint')}
+              </span>
+              {undoing && (
+                <ConfirmStrip
+                  text={t('devices.edit.rollbackConfirm')}
+                  confirm={t('devices.edit.rollbackYes')}
+                  pending={rollback.isPending}
+                  onConfirm={() => rollback.mutate()}
+                  onCancel={() => setUndoing(false)}
+                />
+              )}
             </div>
-          )}
-
-          {device.log !== '' && (
-            <details>
-              <summary className="cursor-pointer text-primary">{t('devices.edit.log')}</summary>
-              <pre
-                className="mt-2 max-h-56 overflow-auto rounded-lg bg-muted p-3 font-mono text-xs whitespace-pre-wrap"
-                translate="no"
-                tabIndex={0}
-              >
-                {device.log}
-              </pre>
-            </details>
           )}
 
           {deleting && (

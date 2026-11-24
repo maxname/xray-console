@@ -71,8 +71,10 @@ const (
 )
 
 type Operation struct {
-	ID         int64
+	ID int64
+	// Whose job it is: a server's or a device's, the other being zero.
 	ServerID   int64
+	DeviceID   int64
 	Kind       string
 	Status     Status
 	Steps      []StepState
@@ -111,8 +113,8 @@ const DefaultStepTimeout = 15 * time.Minute
 
 var (
 	ErrNotFound = errors.New("operation not found")
-	// ErrBusy: the server already has a job running.
-	ErrBusy = errors.New("another operation is running on this server")
+	// ErrBusy: the server, or the device, already has a job running.
+	ErrBusy = errors.New("another operation is already running there")
 	// ErrWrongState: the job is not in a state the request applies to.
 	ErrWrongState = errors.New("operation is not in a state that allows this")
 )
@@ -127,7 +129,7 @@ type Manager struct {
 
 	mu      sync.Mutex
 	running map[int64]context.CancelFunc // by operation id
-	busy    map[int64]int64              // server id → operation id
+	busy    map[owner]int64              // whose job → operation id
 	// stopped: operations the administrator asked to stop, as opposed to ones
 	// cut short by the panel shutting down.
 	stopped map[int64]bool
@@ -142,7 +144,7 @@ func NewManager(base context.Context, db *sql.DB, logger *slog.Logger) *Manager 
 		log:      logger,
 		base:     base,
 		running:  map[int64]context.CancelFunc{},
-		busy:     map[int64]int64{},
+		busy:     map[owner]int64{},
 		stopped:  map[int64]bool{},
 		finished: map[int64]chan struct{}{},
 	}
@@ -255,10 +257,38 @@ func (m *Manager) recoverInterrupted(ctx context.Context, cut *[]*Operation) err
 	return nil
 }
 
-// Create records a new job with every step pending. It does not start it: the
-// job is stored as failed-with-no-error, the state Execute starts from, so that
-// "start" and "retry" are one code path.
+// owner is what a job is on. One job at a time per owner.
+type owner struct {
+	device bool
+	id     int64
+}
+
+func ownerOf(op *Operation) owner {
+	if op.DeviceID != 0 {
+		return owner{device: true, id: op.DeviceID}
+	}
+	return owner{id: op.ServerID}
+}
+
+// Create records a new job on a server with every step pending. It does not
+// start it: the job is stored as failed-with-no-error, the state Execute
+// starts from, so that "start" and "retry" are one code path.
 func (m *Manager) Create(ctx context.Context, serverID int64, kind string, stepIDs []string, params any) (*Operation, error) {
+	return m.create(ctx, owner{id: serverID}, kind, stepIDs, params)
+}
+
+// CreateForDevice is Create for a job on a device.
+func (m *Manager) CreateForDevice(ctx context.Context, deviceID int64, kind string, stepIDs []string, params any) (*Operation, error) {
+	return m.create(ctx, owner{device: true, id: deviceID}, kind, stepIDs, params)
+}
+
+func (m *Manager) create(ctx context.Context, whose owner, kind string, stepIDs []string, params any) (*Operation, error) {
+	var serverID, deviceID any
+	if whose.device {
+		deviceID = whose.id
+	} else {
+		serverID = whose.id
+	}
 	steps := make([]StepState, len(stepIDs))
 	for i, id := range stepIDs {
 		steps[i] = StepState{ID: id, Status: StepPending}
@@ -272,8 +302,8 @@ func (m *Manager) Create(ctx context.Context, serverID int64, kind string, stepI
 		return nil, err
 	}
 	result, err := m.db.ExecContext(ctx, `INSERT INTO operations
-		(server_id, kind, status, steps, params, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		serverID, kind, StatusFailed, string(encodedSteps), string(encodedParams), time.Now().Unix())
+		(server_id, device_id, kind, status, steps, params, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		serverID, deviceID, kind, StatusFailed, string(encodedSteps), string(encodedParams), time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -285,26 +315,32 @@ func (m *Manager) Create(ctx context.Context, serverID int64, kind string, stepI
 }
 
 func (m *Manager) Get(ctx context.Context, id int64) (*Operation, error) {
-	return m.scan(m.db.QueryRowContext(ctx, `SELECT id, server_id, kind, status, steps, error,
-		params, result, started_at, finished_at FROM operations WHERE id = ?`, id))
+	return m.scan(m.db.QueryRowContext(ctx, `SELECT `+columns+` FROM operations WHERE id = ?`, id))
 }
 
-// Prune deletes jobs that finished before the cutoff, logs with them. Each
-// server's most recent job stays whatever its age: it is what the server's
-// page shows.
+const columns = `id, server_id, device_id, kind, status, steps, error, params, result, started_at, finished_at`
+
+// Prune deletes jobs that finished before the cutoff, logs with them. The
+// most recent job of each server and of each device stays whatever its age:
+// it is what their pages show.
 func (m *Manager) Prune(ctx context.Context, before time.Time) error {
 	_, err := m.db.ExecContext(ctx, `DELETE FROM operations
 		WHERE status != ? AND finished_at IS NOT NULL AND finished_at < ?
-		AND id NOT IN (SELECT MAX(id) FROM operations GROUP BY server_id)`,
+		AND id NOT IN (SELECT MAX(id) FROM operations GROUP BY server_id, device_id)`,
 		StatusRunning, before.Unix())
 	return err
 }
 
 // LatestForServer returns the server's most recent job, or ErrNotFound.
 func (m *Manager) LatestForServer(ctx context.Context, serverID int64) (*Operation, error) {
-	return m.scan(m.db.QueryRowContext(ctx, `SELECT id, server_id, kind, status, steps, error,
-		params, result, started_at, finished_at FROM operations
+	return m.scan(m.db.QueryRowContext(ctx, `SELECT `+columns+` FROM operations
 		WHERE server_id = ? ORDER BY id DESC LIMIT 1`, serverID))
+}
+
+// LatestForDevice returns the device's most recent job, or ErrNotFound.
+func (m *Manager) LatestForDevice(ctx context.Context, deviceID int64) (*Operation, error) {
+	return m.scan(m.db.QueryRowContext(ctx, `SELECT `+columns+` FROM operations
+		WHERE device_id = ? ORDER BY id DESC LIMIT 1`, deviceID))
 }
 
 func (m *Manager) scan(row *sql.Row) (*Operation, error) {
@@ -312,8 +348,8 @@ func (m *Manager) scan(row *sql.Row) (*Operation, error) {
 	var steps, params, result string
 	var failure sql.NullString
 	var started int64
-	var finished sql.NullInt64
-	err := row.Scan(&op.ID, &op.ServerID, &op.Kind, &op.Status, &steps, &failure,
+	var finished, serverID, deviceID sql.NullInt64
+	err := row.Scan(&op.ID, &serverID, &deviceID, &op.Kind, &op.Status, &steps, &failure,
 		&params, &result, &started, &finished)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -321,6 +357,7 @@ func (m *Manager) scan(row *sql.Row) (*Operation, error) {
 	if err != nil {
 		return nil, err
 	}
+	op.ServerID, op.DeviceID = serverID.Int64, deviceID.Int64
 	op.StartedAt = time.Unix(started, 0)
 	if finished.Valid {
 		op.FinishedAt = time.Unix(finished.Int64, 0)
@@ -424,7 +461,15 @@ func (m *Manager) Cancel(id int64) bool {
 func (m *Manager) Busy(serverID int64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, busy := m.busy[serverID]
+	_, busy := m.busy[owner{id: serverID}]
+	return busy
+}
+
+// BusyDevice reports whether the device has a job running right now.
+func (m *Manager) BusyDevice(deviceID int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, busy := m.busy[owner{device: true, id: deviceID}]
 	return busy
 }
 
@@ -434,15 +479,15 @@ func (m *Manager) wasStopped(id int64) bool {
 	return m.stopped[id]
 }
 
-// claim reserves the server for the job, or reports ErrBusy.
+// claim reserves the job's server or device for it, or reports ErrBusy.
 func (m *Manager) claim(op *Operation) (context.Context, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, taken := m.busy[op.ServerID]; taken {
+	if _, taken := m.busy[ownerOf(op)]; taken {
 		return nil, ErrBusy
 	}
 	ctx, cancel := context.WithCancel(m.base)
-	m.busy[op.ServerID] = op.ID
+	m.busy[ownerOf(op)] = op.ID
 	m.running[op.ID] = cancel
 	m.finished[op.ID] = make(chan struct{})
 	return ctx, nil
@@ -455,7 +500,7 @@ func (m *Manager) release(op *Operation) {
 		cancel()
 	}
 	delete(m.running, op.ID)
-	delete(m.busy, op.ServerID)
+	delete(m.busy, ownerOf(op))
 	delete(m.stopped, op.ID)
 	if done, ok := m.finished[op.ID]; ok {
 		close(done)

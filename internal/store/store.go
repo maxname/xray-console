@@ -66,6 +66,13 @@ func open(ctx context.Context, dsn string) (*sql.DB, error) {
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {
+	return migrateTo(ctx, db, 0)
+}
+
+// migrateTo applies the migrations up to and including version last; all of
+// them when last is 0. Stopping short is for tests that need a database as an
+// older panel left it.
+func migrateTo(ctx context.Context, db *sql.DB, last int) error {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version INTEGER PRIMARY KEY,
 		applied_at INTEGER NOT NULL
@@ -86,6 +93,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		version, err := strconv.Atoi(prefix)
 		if err != nil {
 			return fmt.Errorf("migration %s: name must start with a number", base)
+		}
+		if last != 0 && version > last {
+			break
 		}
 
 		var applied int

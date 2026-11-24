@@ -258,7 +258,7 @@ func runServe(args []string) error {
 	}
 	deviceManager := &devices.Manager{
 		Store: deviceStore, Keys: keyStore, Releases: releases, RuleSets: ruleSetStore, Servers: serverStore,
-		Latest: installer.Latest, Log: logger, Base: jobsCtx,
+		Latest: installer.Latest, Log: logger, Ops: manager,
 		EnsureUser: func(ctx context.Context, serverID int64, userID string) error {
 			err := installer.EnsureUser(ctx, serverID, userID)
 			if errors.Is(err, install.ErrOtherChanges) {

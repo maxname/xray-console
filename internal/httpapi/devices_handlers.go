@@ -37,15 +37,18 @@ type deviceJSON struct {
 	ProxyPassword string `json:"proxy_password,omitempty"`
 	AutoPush      bool   `json:"auto_push"`
 
-	// Status is new | working | ready | failed; Step, where a job is or
-	// stopped.
-	Status      string       `json:"status"`
+	// Status is new | working | ready | failed.
+	Status      string `json:"status"`
+	OSName      string `json:"os_name"`
+	Arch        string `json:"arch"`
+	XrayVersion string `json:"xray_version"`
+	// OperationID is the device's latest job — its steps and its log are
+	// asked for by this id; nil for a device that never had one. Step is the
+	// step it is on or stopped at, Failure why it stopped: the two a list of
+	// devices needs without asking for every job.
+	OperationID *int64       `json:"operation_id"`
 	Step        string       `json:"step"`
-	OSName      string       `json:"os_name"`
-	Arch        string       `json:"arch"`
-	XrayVersion string       `json:"xray_version"`
 	Failure     *ops.Failure `json:"failure"`
-	Log         string       `json:"log"`
 
 	// Online, Service and SeenAt are what the last look at the device found.
 	Online  bool   `json:"online"`
@@ -61,13 +64,33 @@ func (s *Server) deviceView(ctx context.Context, dev *devices.Device, cache map[
 	view := &deviceJSON{
 		ID: dev.ID, Name: dev.Name, Host: dev.Host, SSHPort: dev.SSHPort, SSHUser: dev.SSHUser,
 		RuleSetID: dev.RuleSetID, SocksPort: dev.SocksPort, HTTPPort: dev.HTTPPort,
-		LAN: dev.LAN, AutoPush: dev.AutoPush, Status: dev.Status, Step: dev.Step,
+		LAN: dev.LAN, AutoPush: dev.AutoPush, Status: dev.Status,
 		OSName: dev.OSName, Arch: dev.Arch, XrayVersion: dev.XrayVersion,
-		Failure: dev.Failure, Log: dev.Log, Online: dev.Online, Service: dev.Service,
+		Online: dev.Online, Service: dev.Service,
 		Pending: s.deviceManager.Pending(ctx, dev), Traffic: usage[dev.Label()],
 		ProxyAuth: dev.ProxyAuth,
 	}
 	view.ProxyUser, view.ProxyPassword, _ = dev.ProxyCredentials()
+	job, err := s.deviceManager.Last(ctx, dev.ID)
+	if err != nil {
+		return nil, err
+	}
+	if job != nil {
+		view.OperationID = &job.ID
+		switch job.Status {
+		case ops.StatusRunning:
+			for _, step := range job.Steps {
+				if step.Status == ops.StepRunning {
+					view.Step = step.ID
+				}
+			}
+		case ops.StatusFailed:
+			// A job created and never started is "failed" with no error.
+			if job.Error != nil {
+				view.Step, view.Failure = job.Error.Step, job.Error
+			}
+		}
+	}
 	if !dev.SeenAt.IsZero() {
 		at := dev.SeenAt.Unix()
 		view.SeenAt = &at
@@ -191,6 +214,8 @@ func (s *Server) deviceError(w http.ResponseWriter, r *http.Request, err error) 
 		writeError(w, http.StatusUnprocessableEntity, "bad_rule_set", err.Error(), nil)
 	case errors.Is(err, devices.ErrBusy):
 		writeError(w, http.StatusConflict, "busy", err.Error(), nil)
+	case errors.Is(err, devices.ErrNothingToRetry):
+		writeError(w, http.StatusConflict, "nothing_to_retry", err.Error(), nil)
 	default:
 		return s.serverError(w, r, err)
 	}
@@ -301,6 +326,35 @@ func (s *Server) handleSetupDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.deviceError(w, r, s.deviceManager.Setup(r.Context(), id, req.Password)) {
+		return
+	}
+	s.respondDevices(w, r, http.StatusOK)
+}
+
+// handleRetryDevice goes on with the device's failed job from the step it
+// stopped at.
+func (s *Server) handleRetryDevice(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var req deviceSetupRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if s.deviceError(w, r, s.deviceManager.Retry(r.Context(), id, req.Password)) {
+		return
+	}
+	s.respondDevices(w, r, http.StatusOK)
+}
+
+// handleRollbackDevice undoes a set-up that stopped partway.
+func (s *Server) handleRollbackDevice(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if s.deviceError(w, r, s.deviceManager.Rollback(r.Context(), id)) {
 		return
 	}
 	s.respondDevices(w, r, http.StatusOK)

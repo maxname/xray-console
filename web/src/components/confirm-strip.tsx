@@ -9,11 +9,14 @@ import { Button } from '@/components/ui/button'
  */
 export function ConfirmStrip({
   text,
+  confirm,
   pending,
   onConfirm,
   onCancel,
 }: {
   text: string
+  /** What the button that goes ahead says; "yes, delete" unless given. */
+  confirm?: string
   pending: boolean
   onConfirm: () => void
   onCancel: () => void
@@ -27,7 +30,7 @@ export function ConfirmStrip({
       <span>{text}</span>
       <div className="flex gap-2">
         <Button type="button" size="sm" variant="destructive" disabled={pending} onClick={onConfirm}>
-          {t('common.deleteYes')}
+          {confirm ?? t('common.deleteYes')}
         </Button>
         <Button type="button" size="sm" variant="outline" onClick={onCancel}>
           {t('common.cancel')}

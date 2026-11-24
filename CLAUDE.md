@@ -262,14 +262,25 @@ per-chain traffic, the checks' settings screen.
   `/usr/local/etc/xray-console`, `xray-console-client.service`, user
   `xray-console`), not Xray's usual ones: a device may have an Xray of its
   own — it may even be one of the panel's servers.
-- Setting a device up is six steps in one background job (`devices.Manager`,
-  not the `ops` engine — that one is tied to servers): connect and put the
-  panel's key there, check the system, upload Xray, make the entry server let
-  the device in (`Installer.EnsureUser`: applies the entry by itself, but only
-  when rules and subscriptions are all that is waiting there), put the
-  configuration and start, and send one request through the client's SOCKS
-  port. Steps are safe to repeat; a failure is kept with its log and the job
-  is run again from the start.
+- Setting a device up is a job of six steps in the same engine that runs
+  jobs on servers (`ops`; a job belongs to a server or to a device, kind
+  `device_setup`): connect and put the panel's key there, check the system,
+  upload Xray, make the entry server let the device in
+  (`Installer.EnsureUser`: applies the entry by itself, but only when rules
+  and subscriptions are all that is waiting there), put the configuration and
+  start, and send one request through the client's SOCKS port. Sending
+  changed settings later (`device_push`) is connect, entry, configuration and
+  check. Steps are safe to repeat, and each finds its own way onto the
+  device, so a failed job is gone on with from the step it stopped at
+  (`Manager.Retry`) or run again from the start.
+- A set-up that stopped partway can be undone (`Manager.Rollback`): the
+  client comes off the device, and the panel's key too if this set-up added
+  it; the device stays in the panel as one not set up. A push has nothing to
+  undo — it puts the previous settings back by itself.
+- A device's row says where it stands (`new`, `working`, `ready`, `failed`);
+  what its job is doing, why it stopped and what it printed are the job's
+  (`Manager.Last`, `/api/operations/<id>`). The device's dialog shows the
+  steps while a job runs and steps with the log afterwards.
 - A device's configuration follows what its entry server runs, not what the
   server is about to run. When the server's applied settings change — a key
   rotation — the device shows as waiting, and one that has "send changes
@@ -277,7 +288,6 @@ per-chain traffic, the checks' settings screen.
   which is also how "online" is known). A configuration the client does not
   start with is replaced by the previous one, and the same configuration is
   then not sent again at once: after 5 minutes, then 30, then every 3 hours.
-  A job on a device has 20 minutes.
 - A device's proxies, when open to its network (`lan`), can ask for a user
   and password (`proxy_auth`). The password is derived from the device's
   secret, shown in the device's dialog and nowhere stored; the check after a
@@ -338,7 +348,8 @@ importing other SSH keys.
 - `internal/sshkeys` — the panel's own SSH key.
 - `internal/remote` — how a failed connection or command is told to the
   administrator; shared by jobs on servers and on devices.
-- `internal/ops` — runs step-by-step jobs with a log, retry and rollback.
+- `internal/ops` — runs step-by-step jobs with a log, retry and rollback, on
+  a server or on a device; one job at a time on each.
   Finished jobs older than 90 days are pruned, except each server's latest.
 - `internal/install` — the installation steps, applying settings, the
   connection check, updating Xray, removing it.

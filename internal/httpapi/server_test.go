@@ -95,7 +95,7 @@ func newHarness(t *testing.T, trusted ...netip.Prefix) *harness {
 	deviceStore := devices.NewStore(db, box)
 	deviceManager := &devices.Manager{
 		Store: deviceStore, Keys: keyStore, RuleSets: ruleSetStore, Servers: serverStore,
-		Log: logger, Base: ctx,
+		Log: logger, Ops: manager,
 	}
 	t.Cleanup(deviceManager.Wait)
 	localClient := &localclient.Client{

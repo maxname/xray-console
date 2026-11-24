@@ -8,13 +8,11 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"xray-console/internal/ops"
 	"xray-console/internal/secrets"
 	"xray-console/internal/servers"
 	"xray-console/internal/store"
@@ -55,9 +53,9 @@ type Device struct {
 	ProxyAuth bool
 	AutoPush  bool
 
-	Status string
-	// Step is the step a job is on, or stopped at.
-	Step        string
+	// Status is where the device stands. What its job is doing, why it
+	// stopped and what it printed belong to the job (Manager.Last).
+	Status      string
 	OSName      string
 	Arch        string
 	XrayVersion string
@@ -65,9 +63,6 @@ type Device struct {
 	// Applied is the digest of the configuration on the device; "" before
 	// the first one.
 	Applied string
-	// Failure is why the last job failed; nil if it did not.
-	Failure *ops.Failure
-	Log     string
 
 	// Online, Service and SeenAt are what the last look at the device found.
 	Online  bool
@@ -146,7 +141,7 @@ type Store struct {
 func NewStore(db *sql.DB, box *secrets.Box) *Store { return &Store{db: db, box: box} }
 
 const columns = `id, name, host, ssh_port, ssh_user, host_key, rule_set_id, secret, socks_port, http_port,
-	lan, auto_push, status, step, os_name, arch, xray_version, key_added, applied, failure, log,
+	lan, auto_push, status, os_name, arch, xray_version, key_added, applied,
 	online, service, seen_at, created_at, updated_at, proxy_auth`
 
 type scanner interface{ Scan(dest ...any) error }
@@ -154,12 +149,11 @@ type scanner interface{ Scan(dest ...any) error }
 func (s *Store) scan(row scanner) (*Device, error) {
 	var d Device
 	var secret []byte
-	var failure sql.NullString
 	var seen sql.NullInt64
 	var created, updated int64
 	err := row.Scan(&d.ID, &d.Name, &d.Host, &d.SSHPort, &d.SSHUser, &d.HostKey, &d.RuleSetID, &secret,
-		&d.SocksPort, &d.HTTPPort, &d.LAN, &d.AutoPush, &d.Status, &d.Step, &d.OSName, &d.Arch,
-		&d.XrayVersion, &d.KeyAdded, &d.Applied, &failure, &d.Log, &d.Online, &d.Service, &seen,
+		&d.SocksPort, &d.HTTPPort, &d.LAN, &d.AutoPush, &d.Status, &d.OSName, &d.Arch,
+		&d.XrayVersion, &d.KeyAdded, &d.Applied, &d.Online, &d.Service, &seen,
 		&created, &updated, &d.ProxyAuth)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -169,12 +163,6 @@ func (s *Store) scan(row scanner) (*Device, error) {
 	}
 	if d.secret, err = s.box.Open(secret); err != nil {
 		return nil, fmt.Errorf("device %s: %w", d.Name, err)
-	}
-	if failure.Valid && failure.String != "" {
-		d.Failure = &ops.Failure{}
-		if err := json.Unmarshal([]byte(failure.String), d.Failure); err != nil {
-			d.Failure = nil
-		}
 	}
 	if seen.Valid {
 		d.SeenAt = time.Unix(seen.Int64, 0)
@@ -298,16 +286,12 @@ func (s *Store) set(ctx context.Context, id int64, assignments string, args ...a
 }
 
 // progress records where a job is and what it has logged so far.
-func (s *Store) progress(ctx context.Context, id int64, status, step, log string, failure *ops.Failure) error {
-	var encoded any
-	if failure != nil {
-		raw, err := json.Marshal(failure)
-		if err != nil {
-			return err
-		}
-		encoded = string(raw)
-	}
-	return s.set(ctx, id, `status = ?, step = ?, log = ?, failure = ?`, status, step, log, encoded)
+func (s *Store) setStatus(ctx context.Context, id int64, status string) error {
+	return s.set(ctx, id, `status = ?`, status)
+}
+
+func (s *Store) clearKeyAdded(ctx context.Context, id int64) error {
+	return s.set(ctx, id, `key_added = 0`)
 }
 
 func (s *Store) setSystem(ctx context.Context, id int64, osName, arch string) error {
@@ -341,9 +325,10 @@ func (s *Store) seen(ctx context.Context, id int64, online bool, service string,
 // RecoverInterrupted marks jobs that a panel restart cut short as failed, so
 // that they can be run again instead of showing as running for ever.
 func (s *Store) RecoverInterrupted(ctx context.Context) error {
-	failure, _ := json.Marshal(ops.Fail("interrupted", "the panel was restarted while the job was running", nil))
+	// The job itself is marked by the engine; this is the device's own state:
+	// one that had working settings still has them.
 	_, err := s.db.ExecContext(ctx, `UPDATE devices SET
-		status = CASE WHEN applied = '' THEN ? ELSE ? END, failure = ? WHERE status = ?`,
-		StatusFailed, StatusReady, string(failure), StatusWorking)
+		status = CASE WHEN applied = '' THEN ? ELSE ? END WHERE status = ?`,
+		StatusFailed, StatusReady, StatusWorking)
 	return err
 }

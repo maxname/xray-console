@@ -551,8 +551,9 @@ export interface Device {
   os_name: string
   arch: string
   xray_version: string
+  /** The device's latest job; its steps and log are asked for by this id. */
+  operation_id: number | null
   failure: OperationFailure | null
-  log: string
   /** What the last look at the device found. */
   online: boolean
   service: string
@@ -1022,6 +1023,14 @@ export const api = {
   /** Runs the set-up again from the start. */
   setupDevice: (id: number, password: string) =>
     request<DevicesResponse>('POST', `/api/devices/${id}/setup`, { password }),
+
+  /** Goes on with the device's failed job from the step it stopped at. */
+  retryDevice: (id: number, password: string) =>
+    request<DevicesResponse>('POST', `/api/devices/${id}/retry`, { password }),
+
+  /** Undoes a set-up that stopped partway. */
+  rollbackDevice: (id: number) =>
+    request<DevicesResponse>('POST', `/api/devices/${id}/rollback`),
 
   /** Sends the device its current settings. */
   pushDevice: (id: number) => request<DevicesResponse>('POST', `/api/devices/${id}/push`),

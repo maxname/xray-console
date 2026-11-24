@@ -9,7 +9,16 @@ import {
 import { useCopy } from '@/lib/clipboard'
 import { cn } from '@/lib/utils'
 
-export function StepList({ steps, label }: { steps: StepState[]; label?: string }) {
+export function StepList({
+  steps,
+  label,
+  names = 'server.steps',
+}: {
+  steps: StepState[]
+  label?: string
+  /** Where in the catalogue the steps' names are: a server's by default. */
+  names?: string
+}) {
   const { t } = useTranslation()
   return (
     <ol className="flex flex-col gap-3" aria-label={label ?? t('server.installing.title')}>
@@ -24,7 +33,7 @@ export function StepList({ steps, label }: { steps: StepState[]; label?: string 
                   'text-muted-foreground',
               )}
             >
-              {t(`server.steps.${step.id}`)}
+              {t(`${names}.${step.id}`)}
               <span className="sr-only"> — {t(`server.stepStatus.${step.status}`)}</span>
             </span>
             {step.detail !== '' && (

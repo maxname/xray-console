@@ -94,43 +94,43 @@ type Manager struct {
 	// loopback, reached over the SSH connection.
 	Request func(ctx context.Context, client *sshx.Client, proxyAddr, user, password string) (int, error)
 	Log     *slog.Logger
-	// Base outlives any one request: jobs run on it.
-	Base context.Context
+	// Ops runs the jobs: steps, a log, a retry from the step that failed —
+	// the same engine that runs jobs on servers.
+	Ops *ops.Manager
 
-	mu   sync.Mutex
-	busy map[int64]bool
+	mu sync.Mutex
 	// pushed is when settings were last sent to a device unasked, and which.
 	pushed map[int64]pushAttempt
-	wg     sync.WaitGroup
+}
+
+// Kinds of job on a device.
+const (
+	// KindSetup installs the client from the beginning.
+	KindSetup = "device_setup"
+	// KindPush sends changed settings to a device that is set up.
+	KindPush = "device_push"
+)
+
+func stepOrder(kind string) []string {
+	if kind == KindPush {
+		return []string{StepConnect, StepEntry, StepConfig, StepCheck}
+	}
+	return []string{StepConnect, StepSystem, StepXray, StepEntry, StepConfig, StepCheck}
 }
 
 // Wait blocks until every running job has finished.
-func (m *Manager) Wait() { m.wg.Wait() }
+func (m *Manager) Wait() { m.Ops.Wait() }
 
 // Busy reports whether a job is running on the device.
-func (m *Manager) Busy(id int64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.busy[id]
-}
+func (m *Manager) Busy(id int64) bool { return m.Ops.BusyDevice(id) }
 
-func (m *Manager) claim(id int64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.busy == nil {
-		m.busy = map[int64]bool{}
+// Last returns the device's most recent job, or nil if it never had one.
+func (m *Manager) Last(ctx context.Context, id int64) (*ops.Operation, error) {
+	op, err := m.Ops.LatestForDevice(ctx, id)
+	if errors.Is(err, ops.ErrNotFound) {
+		return nil, nil
 	}
-	if m.busy[id] {
-		return false
-	}
-	m.busy[id] = true
-	return true
-}
-
-func (m *Manager) release(id int64) {
-	m.mu.Lock()
-	delete(m.busy, id)
-	m.mu.Unlock()
+	return op, err
 }
 
 // ErrEntryPending is what EnsureUser answers when the entry server does not
@@ -205,34 +205,98 @@ func (m *Manager) start(ctx context.Context, id int64, password string, full boo
 	if err != nil {
 		return err
 	}
-	if !full && dev.Status != StatusReady {
+	kind := KindPush
+	if full || dev.Status != StatusReady {
 		// Nothing installed to send settings to: that takes a set-up.
-		full = true
+		kind = KindSetup
 	}
-	if !m.claim(id) {
+	if m.Busy(id) {
 		return ErrBusy
 	}
-	if err := m.Store.progress(ctx, id, StatusWorking, "", "", nil); err != nil {
-		m.release(id)
+	op, err := m.Ops.CreateForDevice(ctx, id, kind, stepOrder(kind), map[string]any{})
+	if err != nil {
 		return err
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		defer m.release(id)
-		j := &job{m: m, dev: dev, password: password, wasReady: dev.Status == StatusReady}
-		// A job that outlives this is stuck, and a stuck one would hold the
-		// device — no push, no look at it — until the panel is restarted.
-		ctx, cancel := context.WithTimeout(m.Base, jobLimit)
-		defer cancel()
-		j.run(ctx, full)
-	}()
+	if err := m.execute(ctx, dev, op, password); err != nil {
+		// Lost a race for the device: leave no record of a job that never ran.
+		_ = m.Ops.Delete(ctx, op.ID)
+		return err
+	}
 	return nil
 }
 
-// jobLimit bounds one job. The slowest honest one — uploading Xray over a
-// poor line — is a few minutes.
-const jobLimit = 20 * time.Minute
+// execute runs a job's steps from the first one that is not done.
+func (m *Manager) execute(ctx context.Context, dev *Device, op *ops.Operation, password string) error {
+	j := &job{m: m, dev: dev, password: password, wasReady: dev.Status == StatusReady}
+	return m.launch(ctx, dev, func() error { return m.Ops.Execute(op.ID, j.steps(op.Kind), j.finish) })
+}
+
+// launch marks the device as being worked on and starts the job. The mark
+// goes first: a job that fails at once writes the device's state in its
+// finish, and that must not be overwritten by a late "working".
+func (m *Manager) launch(ctx context.Context, dev *Device, start func() error) error {
+	if err := m.Store.setStatus(ctx, dev.ID, StatusWorking); err != nil {
+		return err
+	}
+	if err := start(); err != nil {
+		if restore := m.Store.setStatus(ctx, dev.ID, dev.Status); restore != nil {
+			m.Log.Error("could not put a device's state back", "device", dev.Name, "err", restore)
+		}
+		if errors.Is(err, ops.ErrBusy) {
+			return ErrBusy
+		}
+		return err
+	}
+	return nil
+}
+
+// ErrNothingToRetry: the device's last job did not stop on a failure.
+var ErrNothingToRetry = errors.New("the device has no failed job to go on with")
+
+// Retry goes on with the device's failed job from the step it stopped at;
+// the steps before it are not repeated. password is for a job that stopped
+// because the panel's key is not on the device.
+func (m *Manager) Retry(ctx context.Context, id int64, password string) error {
+	dev, op, err := m.failed(ctx, id)
+	if err != nil {
+		return err
+	}
+	return m.execute(ctx, dev, op, password)
+}
+
+// Rollback undoes a set-up that stopped partway: what it put on the device is
+// taken off again, and the panel's key too if this set-up added it. The
+// device stays in the panel, as one not set up yet.
+func (m *Manager) Rollback(ctx context.Context, id int64) error {
+	dev, op, err := m.failed(ctx, id)
+	if err != nil {
+		return err
+	}
+	if op.Kind != KindSetup {
+		// A push that fails puts the previous settings back by itself.
+		return ErrNothingToRetry
+	}
+	j := &job{m: m, dev: dev}
+	return m.launch(ctx, dev, func() error { return m.Ops.Rollback(op.ID, j.steps(op.Kind), j.finish) })
+}
+
+func (m *Manager) failed(ctx context.Context, id int64) (*Device, *ops.Operation, error) {
+	dev, err := m.Store.Get(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if m.Busy(id) {
+		return nil, nil, ErrBusy
+	}
+	op, err := m.Last(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if op == nil || op.Status != ops.StatusFailed || op.Error == nil {
+		return nil, nil, ErrNothingToRetry
+	}
+	return dev, op, nil
+}
 
 // job is one run of the steps on one device.
 type job struct {
@@ -243,73 +307,139 @@ type job struct {
 	// then leaves it "ready" with the failure noted, not "failed".
 	wasReady bool
 	client   *sshx.Client
-	log      strings.Builder
-	step     string
+	// run is the step in progress, where the log goes.
+	run *ops.Run
 }
 
-// maxLog bounds a job's log. It is what the device printed, kept in the
-// device's row and sent with the device list.
-const maxLog = 128 << 10
-
+// logf writes a line of the job's log: a command the panel ran when it starts
+// with "$ ", otherwise what came of it.
 func (j *job) logf(format string, args ...any) {
-	if j.log.Len() >= maxLog {
+	if j.run == nil {
 		return
 	}
-	fmt.Fprintf(&j.log, format+"\n", args...)
-	if j.log.Len() >= maxLog {
-		j.log.WriteString("… (the rest of the log is cut)\n")
+	line := fmt.Sprintf(format, args...)
+	if command, ok := strings.CutPrefix(line, "$ "); ok {
+		j.run.Cmd(command)
+		return
+	}
+	j.run.Out(line)
+}
+
+// steps are the job's steps for the engine. Each finds the connection the
+// first step made, or makes one — a job gone on with after a failure starts
+// in the middle, with nothing of the first run left in memory.
+func (j *job) steps(kind string) []ops.Step {
+	run := map[string]func(context.Context) error{
+		StepConnect: j.connect, StepSystem: j.system, StepXray: j.xray,
+		StepEntry: j.entry, StepConfig: j.config, StepCheck: j.check,
+	}
+	undo := map[string]func(context.Context) error{
+		// In reverse, so the key goes last: after that the panel cannot get
+		// back in to undo anything else.
+		StepConnect: j.undoConnect, StepXray: j.undoXray,
+	}
+	var out []ops.Step
+	for _, id := range stepOrder(kind) {
+		step := ops.Step{ID: id, Run: func(ctx context.Context, r *ops.Run) error {
+			j.run = r
+			if id != StepConnect {
+				if err := j.attach(ctx); err != nil {
+					return err
+				}
+			}
+			return run[id](ctx)
+		}}
+		if back := undo[id]; back != nil {
+			step.Undo = func(ctx context.Context, r *ops.Run) error {
+				j.run = r
+				return back(ctx)
+			}
+		}
+		out = append(out, step)
+	}
+	return out
+}
+
+// attach signs in with the panel's key when there is no connection yet.
+func (j *job) attach(ctx context.Context) error {
+	if j.client != nil {
+		return nil
+	}
+	key, err := j.m.Keys.PanelKey(ctx)
+	if err != nil {
+		return err
+	}
+	client, err := sshx.Dial(ctx, j.target(), sshx.Auth{Signer: key.Signer()}, j.dev.HostKey)
+	if err != nil {
+		return sshFailure(err, j.target(), key)
+	}
+	j.client = client
+	return nil
+}
+
+// finish runs after the job's last write: let go of the connection and put
+// the device in the state the outcome implies.
+func (j *job) finish(op *ops.Operation) {
+	if j.client != nil {
+		j.client.Close()
+	}
+	ctx := context.Background()
+	status := StatusFailed
+	switch {
+	case op.Status == ops.StatusSucceeded:
+		status = StatusReady
+		_ = j.m.Store.seen(ctx, j.dev.ID, true, "active", time.Now())
+		j.m.Log.Info("device is set up", "device", j.dev.Name)
+	case op.Status == ops.StatusRolledBack:
+		status = StatusNew
+		if err := j.m.Store.setApplied(ctx, j.dev.ID, ""); err != nil {
+			j.m.Log.Error("could not forget a device's settings", "device", j.dev.Name, "err", err)
+		}
+	case j.wasReady:
+		// It worked before and the previous settings are back: still ready,
+		// with the failure there to be read.
+		status = StatusReady
+	}
+	if op.Status == ops.StatusFailed && op.Error != nil {
+		j.m.Log.Warn("device job failed", "device", j.dev.Name, "step", op.Error.Step, "code", op.Error.Code)
+	}
+	if err := j.m.Store.setStatus(ctx, j.dev.ID, status); err != nil && !errors.Is(err, ErrNotFound) {
+		j.m.Log.Error("could not record a device's state", "device", j.dev.Name, "err", err)
 	}
 }
 
-// save writes the job's progress; a failure to do so is logged, not fatal.
-func (j *job) save(ctx context.Context, status string, failure *ops.Failure) {
-	// The job's own context may be done; its outcome must still be recorded.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if err := j.m.Store.progress(ctx, j.dev.ID, status, j.step, j.log.String(), failure); err != nil {
-		j.m.Log.Error("could not record a device job's progress", "device", j.dev.Name, "err", err)
+// undoXray takes off what the set-up put on the device: the service, the
+// client, its settings, its user.
+func (j *job) undoXray(ctx context.Context) error {
+	if err := j.attach(ctx); err != nil {
+		return err
 	}
+	_, err := j.sudo(ctx, uninstallScript)
+	return err
 }
 
-func (j *job) run(ctx context.Context, full bool) {
-	defer func() {
-		if j.client != nil {
-			j.client.Close()
-		}
-	}()
-	type step struct {
-		id  string
-		run func(context.Context) error
+// undoConnect takes the panel's key off the device, if this device's set-up
+// is what put it there.
+func (j *job) undoConnect(ctx context.Context) error {
+	dev, err := j.m.Store.Get(ctx, j.dev.ID)
+	if err != nil {
+		return err
 	}
-	steps := []step{{StepConnect, j.connect}}
-	if full {
-		steps = append(steps, step{StepSystem, j.system}, step{StepXray, j.xray})
+	if !dev.KeyAdded {
+		return nil
 	}
-	steps = append(steps, step{StepEntry, j.entry}, step{StepConfig, j.config}, step{StepCheck, j.check})
-
-	for _, s := range steps {
-		j.step = s.id
-		j.logf("== %s", s.id)
-		j.save(ctx, StatusWorking, nil)
-		if err := s.run(ctx); err != nil {
-			var failure *ops.Failure
-			if !errors.As(err, &failure) {
-				failure = ops.Fail(ops.CodeInternal, err.Error(), nil)
-			}
-			j.logf("failed: %s", failure.Message)
-			status := StatusFailed
-			if j.wasReady {
-				status = StatusReady
-			}
-			j.save(ctx, status, failure)
-			j.m.Log.Warn("device job failed", "device", j.dev.Name, "step", s.id, "code", failure.Code)
-			return
-		}
+	if err := j.attach(ctx); err != nil {
+		return err
 	}
-	j.step = ""
-	j.save(ctx, StatusReady, nil)
-	_ = j.m.Store.seen(context.WithoutCancel(ctx), j.dev.ID, true, "active", time.Now())
-	j.m.Log.Info("device is set up", "device", j.dev.Name)
+	key, err := j.m.Keys.PanelKey(ctx)
+	if err != nil {
+		return err
+	}
+	j.logf("$ remove %s from ~/.ssh/authorized_keys", key.Name)
+	if _, err := j.client.Run(ctx, sshx.RemoveAuthorizedKey(key.AuthorizedKey())); err != nil {
+		return remote.CommandFailure(err, j.dev.SSHUser)
+	}
+	return j.m.Store.clearKeyAdded(ctx, j.dev.ID)
 }
 
 func (j *job) target() sshx.Target {
@@ -639,10 +769,9 @@ func (m *Manager) Remove(ctx context.Context, id int64) (cleaned bool, err error
 	if err != nil {
 		return false, err
 	}
-	if !m.claim(id) {
+	if m.Busy(id) {
 		return false, ErrBusy
 	}
-	defer m.release(id)
 
 	cleaned = m.clean(ctx, dev)
 	if err := m.Store.Delete(ctx, id); err != nil {
@@ -669,12 +798,7 @@ func (m *Manager) clean(ctx context.Context, dev *Device) bool {
 		return false
 	}
 	defer client.Close()
-	uninstall := `systemctl disable --now ` + ServiceName + ` 2>/dev/null || true
-rm -f ` + ServicePath + `
-systemctl daemon-reload
-rm -rf ` + ClientDir + ` ` + ConfigDir + `
-userdel ` + SystemUser + ` 2>/dev/null || true`
-	if _, err := client.Sudo(ctx, uninstall); err != nil {
+	if _, err := client.Sudo(ctx, uninstallScript); err != nil {
 		return false
 	}
 	if dev.KeyAdded {
@@ -686,6 +810,13 @@ userdel ` + SystemUser + ` 2>/dev/null || true`
 	}
 	return true
 }
+
+// uninstallScript takes the client off a device.
+const uninstallScript = `systemctl disable --now ` + ServiceName + ` 2>/dev/null || true
+rm -f ` + ServicePath + `
+systemctl daemon-reload
+rm -rf ` + ClientDir + ` ` + ConfigDir + `
+userdel ` + SystemUser + ` 2>/dev/null || true`
 
 // --- keeping watch ---------------------------------------------------------------
 

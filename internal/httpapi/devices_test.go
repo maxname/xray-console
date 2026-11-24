@@ -90,11 +90,50 @@ func TestDeviceIsCheckedThenSetUpAndItsFailureIsKept(t *testing.T) {
 		t.Errorf("after the edit: %v", got)
 	}
 
-	// Run again: the same failure, recorded again.
-	if resp := h.do("POST", devPath+"/setup", map[string]any{"password": ""}); resp.status != http.StatusOK {
+	// Its job, with its steps and what it printed, is asked for like any other.
+	jobID := int64(dev["operation_id"].(float64))
+	job := h.do("GET", "/api/operations/"+num(jobID), nil)
+	operation, _ := job.body["operation"].(map[string]any)
+	steps, _ := operation["steps"].([]any)
+	lines, _ := job.body["log"].([]any)
+	if job.status != http.StatusOK || operation["kind"] != "device_setup" || len(steps) != 6 || len(lines) == 0 {
+		t.Fatalf("the device's job: %d %s", job.status, job.raw)
+	}
+
+	// Gone on with from the step it stopped at: the same job, the same failure.
+	if resp := h.do("POST", devPath+"/retry", map[string]any{"password": ""}); resp.status != http.StatusOK {
 		t.Fatalf("retry: %d %s", resp.status, resp.raw)
 	}
 	h.devices.Wait()
+	again := devicesOf(h.do("GET", "/api/devices", nil))[0].(map[string]any)
+	if again["operation_id"] != float64(jobID) || again["status"] != "failed" || again["step"] != "connect" {
+		t.Fatalf("after going on with the job: %v", again)
+	}
+
+	// Run again from the beginning: a job of its own.
+	if resp := h.do("POST", devPath+"/setup", map[string]any{"password": ""}); resp.status != http.StatusOK {
+		t.Fatalf("set up again: %d %s", resp.status, resp.raw)
+	}
+	h.devices.Wait()
+	if fresh := devicesOf(h.do("GET", "/api/devices", nil))[0].(map[string]any); fresh["operation_id"] == float64(jobID) {
+		t.Fatalf("a new set-up reused the old job: %v", fresh)
+	}
+
+	// Undone: the device is as it was when it was added, and there is nothing
+	// left to go on with or to undo.
+	if resp := h.do("POST", devPath+"/rollback", nil); resp.status != http.StatusOK {
+		t.Fatalf("rollback: %d %s", resp.status, resp.raw)
+	}
+	h.devices.Wait()
+	undone := devicesOf(h.do("GET", "/api/devices", nil))[0].(map[string]any)
+	if undone["status"] != "new" || undone["failure"] != nil || undone["step"] != "" {
+		t.Fatalf("after the rollback: %v", undone)
+	}
+	for _, action := range []string{"/retry", "/rollback"} {
+		if resp := h.do("POST", devPath+action, map[string]any{}); resp.status != http.StatusConflict || resp.errorCode() != "nothing_to_retry" {
+			t.Fatalf("%s with nothing failed: %d %s", action, resp.status, resp.raw)
+		}
+	}
 	if resp := h.do("POST", devPath+"/push", nil); resp.status != http.StatusOK {
 		t.Fatalf("push to a device that is not set up: %d %s", resp.status, resp.raw)
 	}

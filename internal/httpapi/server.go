@@ -195,6 +195,8 @@ func (s *Server) Handler() http.Handler {
 	api.Handle("DELETE /api/devices/{id}", s.requireAuth(s.handleDeleteDevice))
 	api.Handle("POST /api/devices/{id}/setup", s.requireAuth(s.handleSetupDevice))
 	api.Handle("POST /api/devices/{id}/push", s.requireAuth(s.handlePushDevice))
+	api.Handle("POST /api/devices/{id}/retry", s.requireAuth(s.handleRetryDevice))
+	api.Handle("POST /api/devices/{id}/rollback", s.requireAuth(s.handleRollbackDevice))
 	api.Handle("PUT /api/local-client", s.requireAuth(s.handleUpdateLocalClient))
 
 	api.Handle("GET /api/stats", s.requireAuth(s.handleStats))

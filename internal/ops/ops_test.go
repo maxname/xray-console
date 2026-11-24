@@ -350,3 +350,83 @@ func TestJobsCutShortByARestartAreReturned(t *testing.T) {
 		t.Fatalf("recovered the same job twice: %+v", again)
 	}
 }
+
+func TestADeviceHasJobsOfItsOwn(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	db := f.manager.db
+	if _, err := db.ExecContext(ctx, `INSERT INTO rule_sets (name, entry_server_id, rules, default_action, created_at, updated_at)
+		VALUES ('Дом', ?, '[]', 'direct', 0, 0)`, f.server); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.ExecContext(ctx, `INSERT INTO devices
+		(name, host, ssh_port, ssh_user, host_key, rule_set_id, secret, socks_port, http_port, created_at, updated_at)
+		VALUES ('Роутер', '192.0.2.9', 22, 'root', 'k', 1, x'00', 10808, 10809, 0, 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, _ := result.LastInsertId()
+	// The same number as the server's id, on purpose: a device and a server
+	// are told apart by what they are, not by their numbers.
+	if device != f.server {
+		t.Fatalf("the test wants a device and a server with the same id, got %d and %d", device, f.server)
+	}
+
+	onDevice, err := f.manager.CreateForDevice(ctx, device, "device_setup", []string{"a", "b", "c"}, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onDevice.DeviceID != device || onDevice.ServerID != 0 {
+		t.Fatalf("a device's job: device %d, server %d", onDevice.DeviceID, onDevice.ServerID)
+	}
+	onServer := f.create()
+
+	// Held in the middle of its first step, so that both are running at once.
+	hold, held := make(chan struct{}), make(chan struct{})
+	steps := f.steps(nil)
+	steps[0].Run = func(context.Context, *Run) error {
+		close(held)
+		<-hold
+		return nil
+	}
+	if err := f.manager.Execute(onDevice.ID, steps, nil); err != nil {
+		t.Fatal(err)
+	}
+	<-held
+	if !f.manager.BusyDevice(device) || f.manager.Busy(f.server) {
+		t.Fatalf("with a job on the device: device busy %v, server busy %v", f.manager.BusyDevice(device), f.manager.Busy(f.server))
+	}
+	// The server is free for a job of its own; the device is not.
+	second, _ := f.manager.CreateForDevice(ctx, device, "device_push", []string{"a", "b", "c"}, map[string]any{})
+	if err := f.manager.Execute(second.ID, f.steps(nil), nil); !errors.Is(err, ErrBusy) {
+		t.Fatalf("a second job on a busy device: %v", err)
+	}
+	if err := f.manager.Execute(onServer.ID, f.steps(nil), nil); err != nil {
+		t.Fatalf("a job on the server while the device is busy: %v", err)
+	}
+	close(hold)
+	f.manager.Wait()
+
+	latest, err := f.manager.LatestForDevice(ctx, device)
+	if err != nil || latest.ID != second.ID {
+		t.Fatalf("the device's latest job: %+v, %v", latest, err)
+	}
+	if latest, err := f.manager.LatestForServer(ctx, f.server); err != nil || latest.ID != onServer.ID {
+		t.Fatalf("the server's latest job: %+v, %v", latest, err)
+	}
+	if done, _ := f.manager.Get(ctx, onDevice.ID); done.Status != StatusSucceeded {
+		t.Fatalf("the device's job: %s", done.Status)
+	}
+	// Old jobs go; the latest of the device and of the server both stay.
+	if err := f.manager.Prune(ctx, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.manager.Get(ctx, onDevice.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the device's older job after pruning: %v", err)
+	}
+	for _, id := range []int64{second.ID, onServer.ID} {
+		if _, err := f.manager.Get(ctx, id); err != nil {
+			t.Fatalf("a latest job was pruned: %v", err)
+		}
+	}
+}

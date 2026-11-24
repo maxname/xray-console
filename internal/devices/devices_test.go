@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"xray-console/internal/chains"
+	"xray-console/internal/ops"
 	"xray-console/internal/plan"
 	"xray-console/internal/planner"
 	"xray-console/internal/rulesets"
 	"xray-console/internal/secrets"
 	"xray-console/internal/servers"
+	"xray-console/internal/sshkeys"
 	"xray-console/internal/store"
 	"xray-console/internal/templates"
 	"xray-console/internal/xray"
@@ -74,8 +76,11 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f.manager = &Manager{
 		Store: f.store, RuleSets: f.rules, Servers: f.servers,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Base: ctx,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+	f.manager.Keys = sshkeys.NewStore(db, box)
+	f.manager.Ops = ops.NewManager(ctx, db, f.manager.Log)
+	t.Cleanup(f.manager.Wait)
 	return f
 }
 
@@ -184,7 +189,7 @@ func TestADeviceIsAUserOfItsEntryAndFollowsWhatTheEntryRuns(t *testing.T) {
 	}
 
 	// Set up, with what it should run.
-	if err := f.store.progress(ctx, dev.ID, StatusReady, "", "", nil); err != nil {
+	if err := f.store.setStatus(ctx, dev.ID, StatusReady); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.store.setApplied(ctx, dev.ID, digest(config)); err != nil {
@@ -267,10 +272,10 @@ func TestAnInterruptedJobCanBeRunAgain(t *testing.T) {
 	working, _ := f.store.Create(ctx, "192.168.1.2", 22, "root", "k", f.settings("Работало"))
 	untouched, _ := f.store.Create(ctx, "192.168.1.3", 22, "root", "k", f.settings("Готовое"))
 	for _, step := range []error{
-		f.store.progress(ctx, fresh.ID, StatusWorking, StepXray, "…", nil),
+		f.store.setStatus(ctx, fresh.ID, StatusWorking),
 		f.store.setApplied(ctx, working.ID, "abc"),
-		f.store.progress(ctx, working.ID, StatusWorking, StepConfig, "…", nil),
-		f.store.progress(ctx, untouched.ID, StatusReady, "", "", nil),
+		f.store.setStatus(ctx, working.ID, StatusWorking),
+		f.store.setStatus(ctx, untouched.ID, StatusReady),
 	} {
 		if step != nil {
 			t.Fatal(step)
@@ -285,9 +290,6 @@ func TestAnInterruptedJobCanBeRunAgain(t *testing.T) {
 		dev, _ := f.store.Get(ctx, id)
 		if dev.Status != want {
 			t.Errorf("%s: %s, want %s", dev.Name, dev.Status, want)
-		}
-		if interrupted := dev.Failure != nil && dev.Failure.Code == "interrupted"; interrupted != (id != untouched.ID) {
-			t.Errorf("%s: failure %+v", dev.Name, dev.Failure)
 		}
 	}
 }
@@ -392,5 +394,133 @@ func TestProxiesOpenToANetworkCanAskForAPassword(t *testing.T) {
 	}
 	if _, otherPassword, _ := other.ProxyCredentials(); otherPassword == password {
 		t.Fatal("two devices share a proxy password")
+	}
+}
+
+// unreachable adds a device nothing answers for: every job on it stops at its
+// first step.
+func (f *fixture) unreachable(name string) *Device {
+	f.t.Helper()
+	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZvciBhIGRldmljZSB0aGF0IGlzIG5vdCB0aGVyZSEh"
+	dev, err := f.store.Create(context.Background(), "127.0.0.1", 1, "root", hostKey, f.settings(name))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return dev
+}
+
+func (f *fixture) settled(id int64) (*Device, *ops.Operation) {
+	f.t.Helper()
+	f.manager.Wait()
+	dev, err := f.store.Get(context.Background(), id)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	op, err := f.manager.Last(context.Background(), id)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return dev, op
+}
+
+func stepsOf(op *ops.Operation) string {
+	var parts []string
+	for _, step := range op.Steps {
+		parts = append(parts, step.ID+":"+string(step.Status))
+	}
+	return strings.Join(parts, " ")
+}
+
+func TestADevicesJobIsAJobWithStepsThatCanBeGoneOnWith(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	dev := f.unreachable("Роутер дома")
+	if op, _ := f.manager.Last(ctx, dev.ID); op != nil {
+		t.Fatalf("a device nothing was done to has a job: %+v", op)
+	}
+	if err := f.manager.Retry(ctx, dev.ID, ""); !errors.Is(err, ErrNothingToRetry) {
+		t.Fatalf("going on with a job that is not there: %v", err)
+	}
+
+	if err := f.manager.Setup(ctx, dev.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	dev, first := f.settled(dev.ID)
+	if dev.Status != StatusFailed {
+		t.Fatalf("a device that could not be reached is %s", dev.Status)
+	}
+	if first == nil || first.Kind != KindSetup || first.DeviceID != dev.ID || first.Status != ops.StatusFailed ||
+		first.Error == nil || first.Error.Code != CodeSSHUnreachable || first.Error.Step != StepConnect {
+		t.Fatalf("its job: %+v", first)
+	}
+	if got := stepsOf(first); got != "connect:failed system:pending xray:pending entry:pending config:pending check:pending" {
+		t.Fatalf("steps %q", got)
+	}
+	log, err := f.manager.Ops.Log(ctx, first.ID, 0)
+	if err != nil || len(log) == 0 || log[0].Step != StepConnect || log[0].Kind != "cmd" {
+		t.Fatalf("the job's log: %+v, %v", log, err)
+	}
+
+	// Gone on with: the same job, from the step it stopped at.
+	if err := f.manager.Retry(ctx, dev.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	dev, again := f.settled(dev.ID)
+	if again.ID != first.ID || again.Status != ops.StatusFailed || dev.Status != StatusFailed {
+		t.Fatalf("after going on with it: job %d (was %d), %s, device %s", again.ID, first.ID, again.Status, dev.Status)
+	}
+
+	// Sending settings to a device that is not set up is a set-up, and a
+	// job of its own.
+	if err := f.manager.Push(ctx, dev.ID); err != nil {
+		t.Fatal(err)
+	}
+	dev, pushed := f.settled(dev.ID)
+	if pushed.ID == first.ID || pushed.Kind != KindSetup {
+		t.Fatalf("a push to a device that is not set up: job %d of kind %s", pushed.ID, pushed.Kind)
+	}
+
+	// Undone: nothing got as far as the device, so there is nothing to take
+	// off it, and it is as it was when it was added.
+	if err := f.manager.Rollback(ctx, dev.ID); err != nil {
+		t.Fatal(err)
+	}
+	dev, undone := f.settled(dev.ID)
+	if undone.Status != ops.StatusRolledBack || dev.Status != StatusNew || dev.Applied != "" {
+		t.Fatalf("after the rollback: job %s, device %s, applied %q", undone.Status, dev.Status, dev.Applied)
+	}
+	if err := f.manager.Rollback(ctx, dev.ID); !errors.Is(err, ErrNothingToRetry) {
+		t.Fatalf("undoing what is undone: %v", err)
+	}
+}
+
+func TestSettingsSentToAWorkingDeviceLeaveItWorkingWhenTheyFail(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	dev := f.unreachable("Роутер дома")
+	// Set up and working, as far as the panel knows.
+	for _, step := range []error{f.store.setStatus(ctx, dev.ID, StatusReady), f.store.setApplied(ctx, dev.ID, "abc")} {
+		if step != nil {
+			t.Fatal(step)
+		}
+	}
+	if err := f.manager.Push(ctx, dev.ID); err != nil {
+		t.Fatal(err)
+	}
+	dev, op := f.settled(dev.ID)
+	if op.Kind != KindPush || op.Status != ops.StatusFailed {
+		t.Fatalf("the job: %s, %s", op.Kind, op.Status)
+	}
+	if got := stepsOf(op); got != "connect:failed entry:pending config:pending check:pending" {
+		t.Fatalf("steps %q", got)
+	}
+	// It had settings that worked and still has them.
+	if dev.Status != StatusReady || dev.Applied != "abc" {
+		t.Fatalf("the device after a failed push: %s, applied %q", dev.Status, dev.Applied)
+	}
+	// A push puts the previous settings back by itself; there is nothing of
+	// a set-up to undo.
+	if err := f.manager.Rollback(ctx, dev.ID); !errors.Is(err, ErrNothingToRetry) {
+		t.Fatalf("undoing a push: %v", err)
 	}
 }
