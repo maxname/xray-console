@@ -35,10 +35,9 @@ import {
   type ChainStrategy,
   type Server,
 } from '@/lib/api'
+import { explainKnown, listed, type Translate } from '@/lib/errors'
 import { formatDayTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
-
-type Translate = (key: string, options?: Record<string, unknown>) => string
 
 const KNOWN_ERRORS = [
   'name_taken',
@@ -56,16 +55,10 @@ function explain(t: Translate, error: unknown): string {
       return t(`chains.errors.hop.${reason}`, { number, defaultValue: t('common.error') })
     }
     if (error.code === 'chain_in_rule_sets') {
-      const sets = error.details.rule_sets
-      return t('chains.errors.chain_in_rule_sets', {
-        sets: Array.isArray(sets) ? sets.join(', ') : '',
-      })
-    }
-    if ((KNOWN_ERRORS as readonly string[]).includes(error.code)) {
-      return t(`chains.errors.${error.code}`)
+      return t('chains.errors.chain_in_rule_sets', { sets: listed(error, 'rule_sets') })
     }
   }
-  return t('common.error')
+  return explainKnown(t, error, 'chains', KNOWN_ERRORS)
 }
 
 const chainsKey = ['chains'] as const

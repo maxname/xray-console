@@ -84,7 +84,7 @@ func (s *Server) serverView(ctx context.Context, srv *servers.Server) (serverJSO
 	// is safe to send to a browser.
 	if in := srv.Inbound; in != nil {
 		view.Inbound = &inboundJSON{
-			Port: in.Port, MaskHost: in.ServerNames[0], PublicKey: in.PublicKey,
+			Port: in.Port, MaskHost: in.MaskHost(), PublicKey: in.PublicKey,
 			ShortIDs: len(in.ShortIDs), XHTTPPath: in.XHTTPPath, XHTTPMode: in.XHTTPMode,
 		}
 	}

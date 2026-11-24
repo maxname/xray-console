@@ -159,12 +159,79 @@ type Auth struct {
 	Signer   ssh.Signer
 }
 
+// Remote is a machine the panel is signed in to: what jobs do there. *Client
+// is the one that exists; jobs are written against this so that they can be
+// run, in tests, against a machine that is not there — and made to fail in
+// the ways a real one rarely does on demand.
+type Remote interface {
+	// Run executes a script as the login user, Sudo as root. Both return what
+	// was printed; a non-zero exit is an *ExitError.
+	Run(ctx context.Context, script string) (string, error)
+	Sudo(ctx context.Context, script string) (string, error)
+	// WriteFile creates path as root with the given mode, in one step.
+	WriteFile(ctx context.Context, path string, mode uint32, content io.Reader) error
+	// DialTCP opens a connection from the machine's side.
+	DialTCP(ctx context.Context, addr string) (net.Conn, error)
+	Target() Target
+	Close() error
+}
+
+var _ Remote = (*Client)(nil)
+
 // Client is an authenticated connection.
 type Client struct {
 	conn   *ssh.Client
 	target Target
 	// sudo: the login user is not root, so root commands go through sudo -n.
 	sudo bool
+
+	closing sync.Once
+	closed  chan struct{}
+}
+
+// How often a connection is asked whether the other end is still there, and
+// how long it has to answer. The wait is several times the interval on
+// purpose: during an upload the question queues behind megabytes of file, and
+// a slow line is not a dead one.
+const (
+	keepaliveEvery = 20 * time.Second
+	keepaliveWait  = 60 * time.Second
+)
+
+// keepalive closes the connection when the server stops answering. Without it
+// a server that goes silent mid-command — rebooted, cut off, its address gone
+// — leaves the command, and the job around it, waiting for ever: TCP alone
+// does not notice a peer that simply stops.
+func (c *Client) keepalive(every, wait time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-ticker.C:
+		}
+		answered := make(chan error, 1)
+		go func() {
+			_, _, err := c.conn.SendRequest("keepalive@openssh.com", true, nil)
+			answered <- err
+		}()
+		timer := time.NewTimer(wait)
+		select {
+		case err := <-answered:
+			timer.Stop()
+			if err != nil {
+				c.Close()
+				return
+			}
+		case <-timer.C:
+			c.Close()
+			return
+		case <-c.closed:
+			timer.Stop()
+			return
+		}
+	}
 }
 
 // Dial connects to target, accepting only the host key in pinned
@@ -223,7 +290,9 @@ func Dial(ctx context.Context, target Target, auth Auth, pinned string) (*Client
 			return nil, fmt.Errorf("%w: %v", ErrUnreachable, err)
 		}
 	}
-	return &Client{conn: conn, target: target, sudo: target.User != "root"}, nil
+	client := &Client{conn: conn, target: target, sudo: target.User != "root", closed: make(chan struct{})}
+	go client.keepalive(keepaliveEvery, keepaliveWait)
+	return client, nil
 }
 
 func dial(ctx context.Context, target Target, config *ssh.ClientConfig) (*ssh.Client, error) {
@@ -251,7 +320,10 @@ func dial(ctx context.Context, target Target, config *ssh.ClientConfig) (*ssh.Cl
 	return ssh.NewClient(conn, chans, reqs), nil
 }
 
-func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) Close() error {
+	c.closing.Do(func() { close(c.closed) })
+	return c.conn.Close()
+}
 
 // Target is where this client is connected.
 func (c *Client) Target() Target { return c.target }
@@ -268,6 +340,38 @@ func (c *Client) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 // Quote makes s safe to put in a shell command as one word.
 func Quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// InstallAuthorizedKey is a script, for the login user, that puts the panel's
+// key into ~/.ssh/authorized_keys. line is the key as it is looked for,
+// publicKey the line as it is added; run twice it adds nothing the second
+// time.
+func InstallAuthorizedKey(line, publicKey string) string {
+	return `umask 077
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+grep -qF ` + Quote(line) + ` ~/.ssh/authorized_keys || printf '%s\n' ` + Quote(publicKey) + ` >> ~/.ssh/authorized_keys`
+}
+
+// RemoveAuthorizedKey is a script, for the login user, that takes one line out
+// of ~/.ssh/authorized_keys.
+//
+// It is careful about the one way this can go badly wrong: if the filtered
+// copy could not be made — the file would not read, the disk is full — the
+// original is left exactly as it was. Only grep's "some lines left" (0) and
+// "no lines left" (1) count as a copy; writing an empty or missing copy over
+// the file would lock the owner out of their own server.
+func RemoveAuthorizedKey(line string) string {
+	return `f=~/.ssh/authorized_keys
+[ -f "$f" ] || exit 0
+rm -f "$f.xc-tmp"
+grep -vF ` + Quote(line) + ` "$f" > "$f.xc-tmp"
+case $? in
+0|1) ;;
+*) rm -f "$f.xc-tmp"; exit 1 ;;
+esac
+[ -f "$f.xc-tmp" ] || exit 1
+cat "$f.xc-tmp" > "$f" && rm -f "$f.xc-tmp"`
 }
 
 // asRoot wraps a shell script so it runs as root.
@@ -344,9 +448,18 @@ func (c *Client) exec(ctx context.Context, command string, stdin io.Reader) (str
 	return output.String(), fmt.Errorf("%w: %v", ErrUnreachable, err)
 }
 
+// maxOutput is how much of a command's output is kept. Nothing the panel runs
+// prints anywhere near this much; a server that does is broken or hostile, and
+// its output must not become the panel's memory.
+const maxOutput = 4 << 20
+
 // lockedBuffer is a bytes.Buffer two goroutines may write to. It deliberately
 // has only Write: io.Copy would otherwise find bytes.Buffer's ReadFrom and
 // bypass the lock.
+//
+// It keeps the first maxOutput bytes and drops the rest, still reporting every
+// write as taken: the command has to be read to its end either way, or it
+// would block on a full pipe.
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -355,6 +468,12 @@ type lockedBuffer struct {
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if room := maxOutput - b.buf.Len(); room < len(p) {
+		if room > 0 {
+			b.buf.Write(p[:room])
+		}
+		return len(p), nil
+	}
 	return b.buf.Write(p)
 }
 

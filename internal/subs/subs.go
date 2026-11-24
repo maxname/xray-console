@@ -96,7 +96,11 @@ func (s *Store) scan(row scanner) (*Subscription, error) {
 }
 
 func (s *Store) List(ctx context.Context) ([]*Subscription, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM subscriptions ORDER BY id`)
+	return s.list(ctx, `SELECT `+columns+` FROM subscriptions ORDER BY id`)
+}
+
+func (s *Store) list(ctx context.Context, query string, args ...any) ([]*Subscription, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -124,17 +128,9 @@ func (s *Store) ByToken(ctx context.Context, token string) (*Subscription, error
 
 // ForRuleSet returns the subscriptions on a rule set.
 func (s *Store) ForRuleSet(ctx context.Context, ruleSetID int64) ([]*Subscription, error) {
-	all, err := s.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Subscription
-	for _, sub := range all {
-		if sub.RuleSetID == ruleSetID {
-			out = append(out, sub)
-		}
-	}
-	return out, nil
+	// Asked for every server's plan: only the set's own rows are read, and
+	// only their secrets opened.
+	return s.list(ctx, `SELECT `+columns+` FROM subscriptions WHERE rule_set_id = ? ORDER BY id`, ruleSetID)
 }
 
 func hashToken(token string) []byte {

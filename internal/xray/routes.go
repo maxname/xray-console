@@ -117,9 +117,9 @@ func DeriveUUID(secret []byte, label string) string {
 func (in *Inbound) clientStream() object {
 	stream := in.streamSettings()
 	stream["realitySettings"] = object{
-		"serverName":  in.ServerNames[0],
+		"serverName":  in.MaskHost(),
 		"publicKey":   in.PublicKey,
-		"shortId":     in.ShortIDs[0],
+		"shortId":     in.shortID(),
 		"fingerprint": "chrome",
 	}
 	return stream

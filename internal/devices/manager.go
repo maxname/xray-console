@@ -15,6 +15,7 @@ import (
 
 	"xray-console/internal/ops"
 	"xray-console/internal/plan"
+	"xray-console/internal/remote"
 	"xray-console/internal/rulesets"
 	"xray-console/internal/servers"
 	"xray-console/internal/sshkeys"
@@ -50,12 +51,12 @@ const (
 // Failure codes. Where a server's installation has the same failure the code
 // is the same, so the explanation is too.
 const (
-	CodeSSHUnreachable      = "ssh_unreachable"
-	CodeSSHHostKeyChanged   = "ssh_host_key_changed"
-	CodeSSHPasswordRejected = "ssh_password_rejected"
-	CodeSSHPasswordRequired = "ssh_password_required"
-	CodeSSHKeyRejected      = "ssh_key_rejected"
-	CodeNoRoot              = "no_root"
+	CodeSSHUnreachable      = remote.CodeSSHUnreachable
+	CodeSSHHostKeyChanged   = remote.CodeSSHHostKeyChanged
+	CodeSSHPasswordRejected = remote.CodeSSHPasswordRejected
+	CodeSSHPasswordRequired = remote.CodeSSHPasswordRequired
+	CodeSSHKeyRejected      = remote.CodeSSHKeyRejected
+	CodeNoRoot              = remote.CodeNoRoot
 	CodeUnsupportedOS       = "unsupported_os"
 	CodeUnsupportedArch     = "unsupported_arch"
 	CodeDownloadFailed      = "download_failed"
@@ -98,7 +99,9 @@ type Manager struct {
 
 	mu   sync.Mutex
 	busy map[int64]bool
-	wg   sync.WaitGroup
+	// pushed is when settings were last sent to a device unasked, and which.
+	pushed map[int64]pushAttempt
+	wg     sync.WaitGroup
 }
 
 // Wait blocks until every running job has finished.
@@ -217,10 +220,18 @@ func (m *Manager) start(ctx context.Context, id int64, password string, full boo
 		defer m.wg.Done()
 		defer m.release(id)
 		j := &job{m: m, dev: dev, password: password, wasReady: dev.Status == StatusReady}
-		j.run(m.Base, full)
+		// A job that outlives this is stuck, and a stuck one would hold the
+		// device — no push, no look at it — until the panel is restarted.
+		ctx, cancel := context.WithTimeout(m.Base, jobLimit)
+		defer cancel()
+		j.run(ctx, full)
 	}()
 	return nil
 }
+
+// jobLimit bounds one job. The slowest honest one — uploading Xray over a
+// poor line — is a few minutes.
+const jobLimit = 20 * time.Minute
 
 // job is one run of the steps on one device.
 type job struct {
@@ -235,8 +246,18 @@ type job struct {
 	step     string
 }
 
+// maxLog bounds a job's log. It is what the device printed, kept in the
+// device's row and sent with the device list.
+const maxLog = 128 << 10
+
 func (j *job) logf(format string, args ...any) {
+	if j.log.Len() >= maxLog {
+		return
+	}
 	fmt.Fprintf(&j.log, format+"\n", args...)
+	if j.log.Len() >= maxLog {
+		j.log.WriteString("… (the rest of the log is cut)\n")
+	}
 }
 
 // save writes the job's progress; a failure to do so is logged, not fatal.
@@ -296,22 +317,7 @@ func (j *job) target() sshx.Target {
 
 // sshFailure turns a connection error into the failure the interface explains.
 func sshFailure(err error, target sshx.Target, key *sshkeys.Key) error {
-	var changed *sshx.HostKeyChangedError
-	switch {
-	case errors.As(err, &changed):
-		return ops.Fail(CodeSSHHostKeyChanged, err.Error(), map[string]any{
-			"expected": changed.Expected.Fingerprint, "got": changed.Got.Fingerprint,
-		})
-	case errors.Is(err, sshx.ErrPasswordRejected):
-		return ops.Fail(CodeSSHPasswordRejected, err.Error(), map[string]any{"target": target.String()})
-	case errors.Is(err, sshx.ErrKeyRejected):
-		return ops.Fail(CodeSSHKeyRejected, err.Error(), map[string]any{
-			"target": target.String(), "key_name": key.Name, "public_key": key.PublicKey,
-		})
-	case errors.Is(err, sshx.ErrUnreachable):
-		return ops.Fail(CodeSSHUnreachable, err.Error(), map[string]any{"target": target.String()})
-	}
-	return err
+	return remote.SSHFailure(err, target, key)
 }
 
 // sudo runs a root script on the device and logs it with its output.
@@ -324,15 +330,11 @@ func (j *job) sudo(ctx context.Context, script string) (string, error) {
 		j.logf("%s", trimmed)
 	}
 	if err != nil {
-		var exit *sshx.ExitError
-		if errors.As(err, &exit) && strings.Contains(exit.Output, "sudo:") {
-			return out, ops.Fail(CodeNoRoot, strings.TrimSpace(exit.Output), map[string]any{"user": j.dev.SSHUser})
-		}
-		if errors.Is(err, sshx.ErrUnreachable) {
-			return out, ops.Fail(CodeSSHUnreachable, err.Error(), nil)
-		}
+		// The same reading of a failure as on a server: sudo refusing is one
+		// thing, a command that merely mentions sudo another.
+		return out, remote.CommandFailure(err, j.dev.SSHUser)
 	}
-	return out, err
+	return out, nil
 }
 
 // --- steps ---------------------------------------------------------------------
@@ -353,12 +355,7 @@ func (j *job) connect(ctx context.Context) error {
 		if err != nil {
 			return sshFailure(err, target, key)
 		}
-		// grep first: running this twice must not add the line twice.
-		script := fmt.Sprintf(`umask 077
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
-grep -qF %s ~/.ssh/authorized_keys || printf '%%s\n' %s >> ~/.ssh/authorized_keys`,
-			sshx.Quote(key.AuthorizedKey()), sshx.Quote(key.PublicKey))
+		script := sshx.InstallAuthorizedKey(key.AuthorizedKey(), key.PublicKey)
 		j.logf("$ ssh-copy-id -i %s.pub %s", key.Name, target)
 		_, err = byPassword.Run(ctx, script)
 		byPassword.Close()
@@ -453,7 +450,9 @@ func (j *job) xray(ctx context.Context) error {
 			return ops.Fail(CodeUploadCorrupted, "checksum after upload is "+got+", expected "+binary.SHA256,
 				map[string]any{"file": ClientBinary})
 		}
-		if _, err := j.sudo(ctx, "mv -f "+ClientBinary+".new "+ClientBinary+"\n"+ClientBinary+" version | head -n 1"); err != nil {
+		// set -e, and the version on a line of its own: piped into head, a
+		// binary that cannot run would still look like a success.
+		if _, err := j.sudo(ctx, "set -e\nmv -f "+ClientBinary+".new "+ClientBinary+"\n"+ClientBinary+" version >/dev/null"); err != nil {
 			return err
 		}
 	}
@@ -676,10 +675,7 @@ userdel ` + SystemUser + ` 2>/dev/null || true`
 	}
 	if dev.KeyAdded {
 		// Last: after this the panel cannot get back in.
-		script := fmt.Sprintf(`f=~/.ssh/authorized_keys
-[ -f "$f" ] || exit 0
-grep -vF %s "$f" > "$f.xc-tmp" || true
-cat "$f.xc-tmp" > "$f" && rm -f "$f.xc-tmp"`, sshx.Quote(key.AuthorizedKey()))
+		script := sshx.RemoveAuthorizedKey(key.AuthorizedKey())
 		if _, err := client.Run(ctx, script); err != nil {
 			return false
 		}
@@ -703,39 +699,117 @@ func (m *Manager) Sweep(ctx context.Context) {
 		m.Log.Warn("could not load the panel key", "err", err)
 		return
 	}
+	// Several at a time: a device that is switched off takes the whole
+	// timeout to say nothing, and one after another a few of those would
+	// keep the rest waiting past the next sweep.
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
 	for _, dev := range all {
-		if ctx.Err() != nil {
-			return
-		}
 		if dev.Status != StatusReady || m.Busy(dev.ID) {
 			continue
 		}
-		look, cancel := context.WithTimeout(ctx, 15*time.Second)
-		target := sshx.Target{Host: dev.Host, Port: dev.SSHPort, User: dev.SSHUser}
-		client, err := sshx.Dial(look, target, sshx.Auth{Signer: key.Signer()}, dev.HostKey)
-		if err != nil {
-			cancel()
-			_ = m.Store.seen(ctx, dev.ID, false, "", time.Time{})
-			continue
-		}
-		state, _ := client.Sudo(look, "systemctl is-active "+ServiceName+" || true")
-		client.Close()
-		cancel()
-		_ = m.Store.seen(ctx, dev.ID, true, lastLine(state), time.Now())
-
-		if !dev.AutoPush || !m.Pending(ctx, dev) {
-			continue
-		}
-		// Only once the entry server knows the device: until then there is
-		// nothing a new configuration could connect with.
-		if _, entry, err := m.Desired(ctx, dev); err != nil || entry.Applied == nil ||
-			!strings.Contains(entry.Applied.Config, dev.UserID()) {
-			continue
-		}
-		if err := m.Push(ctx, dev.ID); err != nil && !errors.Is(err, ErrBusy) {
-			m.Log.Warn("could not send settings to a device", "device", dev.Name, "err", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					m.Log.Error("looking at a device panicked", "device", dev.Name, "panic", rec)
+				}
+			}()
+			if ctx.Err() != nil {
+				return
+			}
+			m.look(ctx, sshx.Auth{Signer: key.Signer()}, dev)
+		}()
 	}
+	wg.Wait()
+}
+
+// look finds out whether a device is there and what its client is doing, and
+// sends it settings that are waiting if it asked for that.
+func (m *Manager) look(ctx context.Context, auth sshx.Auth, dev *Device) {
+	look, cancel := context.WithTimeout(ctx, 15*time.Second)
+	target := sshx.Target{Host: dev.Host, Port: dev.SSHPort, User: dev.SSHUser}
+	client, err := sshx.Dial(look, target, auth, dev.HostKey)
+	if err != nil {
+		cancel()
+		_ = m.Store.seen(ctx, dev.ID, false, "", time.Time{})
+		return
+	}
+	state, _ := client.Sudo(look, "systemctl is-active "+ServiceName+" || true")
+	client.Close()
+	cancel()
+	_ = m.Store.seen(ctx, dev.ID, true, lastLine(state), time.Now())
+
+	if !dev.AutoPush {
+		return
+	}
+	config, entry, err := m.Desired(ctx, dev)
+	if err != nil || digest(config) == dev.Applied {
+		m.forgetPush(dev.ID)
+		return
+	}
+	// Only once the entry server knows the device: until then there is
+	// nothing a new configuration could connect with.
+	if entry.Applied == nil || !strings.Contains(entry.Applied.Config, dev.UserID()) {
+		return
+	}
+	if !m.duePush(dev.ID, digest(config), time.Now()) {
+		return
+	}
+	if err := m.Push(ctx, dev.ID); err != nil && !errors.Is(err, ErrBusy) {
+		m.Log.Warn("could not send settings to a device", "device", dev.Name, "err", err)
+	}
+}
+
+// pushAttempt is the last time settings were sent to a device by themselves.
+type pushAttempt struct {
+	digest string
+	at     time.Time
+	count  int
+}
+
+// pushRetryAfter is how long to wait before sending the same settings again
+// after the count-th time they did not take.
+func pushRetryAfter(count int) time.Duration {
+	switch {
+	case count <= 1:
+		return 5 * time.Minute
+	case count == 2:
+		return 30 * time.Minute
+	default:
+		return 3 * time.Hour
+	}
+}
+
+// duePush reports whether settings with this digest may be sent to the device
+// now, and notes that they are being. Settings that were sent and did not
+// take — the client would not start with them, the check failed — are still
+// waiting a minute later, and sending them again restarts the client again;
+// so the same settings wait longer each time. Different settings go at once.
+func (m *Manager) duePush(id int64, digest string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pushed == nil {
+		m.pushed = map[int64]pushAttempt{}
+	}
+	last := m.pushed[id]
+	if last.digest != digest {
+		last = pushAttempt{digest: digest}
+	} else if now.Sub(last.at) < pushRetryAfter(last.count) {
+		return false
+	}
+	last.at, last.count = now, last.count+1
+	m.pushed[id] = last
+	return true
+}
+
+func (m *Manager) forgetPush(id int64) {
+	m.mu.Lock()
+	delete(m.pushed, id)
+	m.mu.Unlock()
 }
 
 // Run sweeps every interval until ctx is done.

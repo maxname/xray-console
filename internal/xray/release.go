@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -69,6 +70,8 @@ func (b *Bundle) File(name string) *File {
 type Releases struct {
 	cacheDir string
 	client   *http.Client
+	// base is where releases are published; tests point it elsewhere.
+	base string
 
 	mu          sync.Mutex
 	latest      string
@@ -78,6 +81,7 @@ type Releases struct {
 func NewReleases(cacheDir string) *Releases {
 	return &Releases{
 		cacheDir: cacheDir,
+		base:     releaseBase,
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
 			// The "latest" link answers with a redirect to the versioned page;
@@ -86,10 +90,27 @@ func NewReleases(cacheDir string) *Releases {
 				if strings.HasSuffix(via[0].URL.Path, "/releases/latest") {
 					return http.ErrUseLastResponse
 				}
+				// A release is followed only to where GitHub keeps its files.
+				// What is downloaded here ends up running as root on every
+				// server; it is not fetched from wherever a redirect points.
+				if !releaseHost(req.URL, via[0].URL) {
+					return fmt.Errorf("refusing a redirect to %s", req.URL.Host)
+				}
 				return nil
 			},
 		},
 	}
+}
+
+// releaseHost reports whether a redirect leads somewhere a release may be
+// fetched from: GitHub's own hosts over HTTPS, or the host first asked.
+func releaseHost(to, first *url.URL) bool {
+	if to.Host == first.Host && to.Scheme == first.Scheme {
+		return true
+	}
+	host := to.Hostname()
+	return to.Scheme == "https" &&
+		(host == "github.com" || strings.HasSuffix(host, ".github.com") || strings.HasSuffix(host, ".githubusercontent.com"))
 }
 
 var versionPattern = regexp.MustCompile(`^v\d+(\.\d+){1,3}$`)
@@ -142,7 +163,7 @@ func (r *Releases) Latest(ctx context.Context) (string, error) {
 		return r.latest, nil
 	}
 
-	resp, err := r.get(ctx, releaseBase+"/latest")
+	resp, err := r.get(ctx, r.base+"/latest")
 	if err != nil {
 		return "", err
 	}
@@ -169,50 +190,102 @@ func (r *Releases) Fetch(ctx context.Context, version, arch string) (*Bundle, er
 
 	dir := filepath.Join(r.cacheDir, version)
 	archivePath := filepath.Join(dir, asset)
-	archive, err := os.ReadFile(archivePath)
-	if errors.Is(err, os.ErrNotExist) {
-		if archive, err = r.download(ctx, version, asset); err != nil {
+	archive, ok, err := readCached(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		var sum string
+		if archive, sum, err = r.download(ctx, version, asset); err != nil {
 			return nil, err
 		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
-		// Write-then-rename: a download interrupted halfway must not be
-		// mistaken for a cached release next time.
-		tmp := archivePath + ".part"
-		if err := os.WriteFile(tmp, archive, 0o600); err != nil {
+		// The archive first, its checksum last: an archive without a
+		// checksum is downloaded again, never trusted.
+		if err := writeWhole(archivePath, archive); err != nil {
 			return nil, err
 		}
-		if err := os.Rename(tmp, archivePath); err != nil {
+		if err := writeWhole(archivePath+checksumSuffix, []byte(sum+"\n")); err != nil {
 			return nil, err
 		}
-	} else if err != nil {
-		return nil, err
 	}
 	return unpack(version, archive)
 }
 
-func (r *Releases) download(ctx context.Context, version, asset string) ([]byte, error) {
-	base := releaseBase + "/download/" + version + "/" + asset
+// checksumSuffix names the file kept next to a cached archive with the
+// published SHA-256 it was checked against when it was downloaded.
+const checksumSuffix = ".sha256"
+
+// readCached returns a cached archive, but only one that still is what was
+// downloaded: these files end up running as root on every server, so a cache
+// that has been damaged since — or has no checksum to go by — counts as no
+// cache at all, and the release is fetched again.
+func readCached(archivePath string) (archive []byte, ok bool, err error) {
+	want, err := os.ReadFile(archivePath + checksumSuffix)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	archive, err = os.ReadFile(archivePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	sum := sha256.Sum256(archive)
+	if hex.EncodeToString(sum[:]) != strings.TrimSpace(string(want)) {
+		return nil, false, nil
+	}
+	return archive, true, nil
+}
+
+// writeWhole puts data at path in one step. The temporary file has a name of
+// its own, so two downloads of the same release at once cannot write into
+// each other's, and a half-written file is never mistaken for a finished one.
+func writeWhole(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.part")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// download fetches an archive and checks it against the published checksum,
+// which it returns with it.
+func (r *Releases) download(ctx context.Context, version, asset string) ([]byte, string, error) {
+	base := r.base + "/download/" + version + "/" + asset
 
 	digest, err := r.getBody(ctx, base+".dgst", 1<<20)
 	if err != nil {
-		return nil, fmt.Errorf("download checksum of %s %s: %w", asset, version, err)
+		return nil, "", fmt.Errorf("download checksum of %s %s: %w", asset, version, err)
 	}
 	want, err := parseDigest(digest)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	archive, err := r.getBody(ctx, base, maxReleaseBytes)
 	if err != nil {
-		return nil, fmt.Errorf("download %s %s: %w", asset, version, err)
+		return nil, "", fmt.Errorf("download %s %s: %w", asset, version, err)
 	}
 	sum := sha256.Sum256(archive)
 	if got := hex.EncodeToString(sum[:]); got != want {
-		return nil, fmt.Errorf("%s %s: checksum mismatch (published %s, downloaded %s)", asset, version, want, got)
+		return nil, "", fmt.Errorf("%s %s: checksum mismatch (published %s, downloaded %s)", asset, version, want, got)
 	}
-	return archive, nil
+	return archive, want, nil
 }
 
 var digestPattern = regexp.MustCompile(`(?im)^SHA2?-?256\s*=\s*([0-9a-f]{64})\s*$`)

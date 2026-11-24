@@ -121,6 +121,10 @@ func (s *session) recordApplied(ctx context.Context, p *plan.Plan) error {
 	return s.inst.Servers.SetApplied(ctx, s.serverID, p.Snapshot(srv, s.inst.now()))
 }
 
+// checkDir is where the throwaway client of the connection check keeps its
+// files on a server, for as long as the check runs.
+const checkDir = "/run/xray-console"
+
 func (s *session) checkThroughInbound(ctx context.Context, run *ops.Run, inbound *xray.Inbound) (int, error) {
 	client, err := s.connect(ctx)
 	if err != nil {
@@ -135,25 +139,37 @@ func (s *session) checkThroughInbound(ctx context.Context, run *ops.Run, inbound
 	if err != nil {
 		return 0, err
 	}
-	base := "/tmp/xc-check-" + strconv.Itoa(port)
-	// 0600: the file holds the panel's own client credentials.
+	// A directory only root can enter, not /tmp: the files are written and
+	// the client is started as root, and a name another user of the server
+	// could guess and get to first is how a file ends up somewhere else.
+	if _, err := s.quietSudo(ctx, "install -d -m 0700 "+checkDir); err != nil {
+		return 0, commandFailure(err, client.Target().User)
+	}
+	base := checkDir + "/check-" + strconv.Itoa(port)
+	pid := ""
+	// Before anything is written, so that nothing — the file holds the
+	// panel's own client credentials — is left behind whichever way this ends.
+	defer func() {
+		// The job's context may already be cancelled; clean up regardless.
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		script := "rm -f " + base + ".json " + base + ".log"
+		if pid != "" {
+			script = "kill " + sshx.Quote(pid) + " 2>/dev/null; " + script
+		}
+		_, _ = s.quietSudo(cleanup, script)
+	}()
 	if err := client.WriteFile(ctx, base+".json", 0o600, strings.NewReader(string(config))); err != nil {
 		return 0, commandFailure(err, client.Target().User)
 	}
 
 	run.Cmd("xray run -config " + base + ".json  # temporary client, socks 127.0.0.1:" + strconv.Itoa(port))
 	// Everything detached from the SSH session, or the command never returns.
-	pid, err := s.quietSudo(ctx, "nohup "+xray.BinaryPath+" run -config "+base+".json >"+base+".log 2>&1 </dev/null & echo $!")
+	started, err := s.quietSudo(ctx, "nohup "+xray.BinaryPath+" run -config "+base+".json >"+base+".log 2>&1 </dev/null & echo $!")
 	if err != nil {
 		return 0, err
 	}
-	pid = strings.TrimSpace(pid)
-	defer func() {
-		// The job's context may already be cancelled; clean up regardless.
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		_, _ = s.quietSudo(cleanup, "kill "+sshx.Quote(pid)+" 2>/dev/null; rm -f "+base+".json "+base+".log")
-	}()
+	pid = strings.TrimSpace(started)
 
 	check := s.inst.check
 	run.Cmd("GET " + check.url + " via the inbound")
@@ -188,7 +204,7 @@ func randomPort() (int, error) {
 // RequestThroughSOCKS makes the check request through a SOCKS proxy on the far
 // machine's loopback, reached over the SSH connection — for a client the panel
 // set up somewhere other than on a server.
-func RequestThroughSOCKS(ctx context.Context, client *sshx.Client, proxyAddr string, check *checkTarget) (int, error) {
+func RequestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr string, check *checkTarget) (int, error) {
 	return requestThroughSOCKS(ctx, client, proxyAddr, check)
 }
 
@@ -198,7 +214,7 @@ func (i *Installer) Target() *checkTarget { return i.check }
 
 // requestThroughSOCKS reaches the SOCKS proxy on the server's loopback through
 // the SSH connection and makes the check request through it.
-func requestThroughSOCKS(ctx context.Context, client *sshx.Client, proxyAddr string, check *checkTarget) (int, error) {
+func requestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr string, check *checkTarget) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 

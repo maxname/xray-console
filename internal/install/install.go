@@ -15,6 +15,7 @@ import (
 	"xray-console/internal/events"
 	"xray-console/internal/ops"
 	"xray-console/internal/plan"
+	"xray-console/internal/remote"
 	"xray-console/internal/servers"
 	"xray-console/internal/sshkeys"
 	"xray-console/internal/sshx"
@@ -43,12 +44,12 @@ var stepOrder = []string{
 
 // Failure codes specific to installing. The UI has a paragraph for each.
 const (
-	CodeSSHUnreachable      = "ssh_unreachable"
-	CodeSSHHostKeyChanged   = "ssh_host_key_changed"
-	CodeSSHPasswordRejected = "ssh_password_rejected"
-	CodeSSHPasswordRequired = "ssh_password_required"
-	CodeSSHKeyRejected      = "ssh_key_rejected"
-	CodeNoRoot              = "no_root"
+	CodeSSHUnreachable      = remote.CodeSSHUnreachable
+	CodeSSHHostKeyChanged   = remote.CodeSSHHostKeyChanged
+	CodeSSHPasswordRejected = remote.CodeSSHPasswordRejected
+	CodeSSHPasswordRequired = remote.CodeSSHPasswordRequired
+	CodeSSHKeyRejected      = remote.CodeSSHKeyRejected
+	CodeNoRoot              = remote.CodeNoRoot
 	CodeUnsupportedOS       = "unsupported_os"
 	CodeUnsupportedArch     = "unsupported_arch"
 	CodeClockSkew           = "clock_skew"
@@ -91,7 +92,7 @@ var (
 )
 
 // dialFunc is sshx.Dial, replaceable in tests.
-type dialFunc func(ctx context.Context, target sshx.Target, auth sshx.Auth, pinned string) (*sshx.Client, error)
+type dialFunc func(ctx context.Context, target sshx.Target, auth sshx.Auth, pinned string) (sshx.Remote, error)
 
 type Installer struct {
 	Servers   *servers.Store
@@ -123,6 +124,23 @@ type Installer struct {
 // Planner is what the installer needs from the planner package.
 type Planner interface {
 	For(ctx context.Context, srv *servers.Server) (*plan.Plan, error)
+	// Awaiting names the servers srv hands chain traffic to whose own
+	// settings are not applied yet.
+	Awaiting(ctx context.Context, srv *servers.Server) ([]string, error)
+	// FarFirst orders servers so that the far end of a chain comes first.
+	FarFirst(ctx context.Context, list []*servers.Server) ([]*servers.Server, error)
+}
+
+// AwaitingError: the server cannot be applied yet, because its new
+// configuration dials other servers the way they will accept connections
+// only once their own settings are applied.
+type AwaitingError struct {
+	// Servers are the ones to apply first, by name.
+	Servers []string
+}
+
+func (e *AwaitingError) Error() string {
+	return "apply these servers first: " + strings.Join(e.Servers, ", ")
 }
 
 func New(srv *servers.Store, keys *sshkeys.Store, tpl *templates.Store, planner Planner, releases *xray.Releases, manager *ops.Manager, logger *slog.Logger) *Installer {
@@ -131,7 +149,7 @@ func New(srv *servers.Store, keys *sshkeys.Store, tpl *templates.Store, planner 
 		Servers: srv, Keys: keys, Templates: tpl, Planner: planner,
 		Releases: releases, Ops: manager, Log: logger,
 		latest: releases.Latest,
-		dial:   sshx.Dial, now: time.Now, check: check,
+		dial:   dialSSH, now: time.Now, check: check,
 		batches: map[string]*Batch{},
 	}
 }
@@ -273,7 +291,7 @@ type session struct {
 	params   Params
 	// password is used once, by the first step, and cleared there.
 	password string
-	client   *sshx.Client
+	client   sshx.Remote
 	// plan is the configuration this run put (or is putting) on the server.
 	plan *plan.Plan
 	// backup is where an apply saved the configuration it replaced.
@@ -355,7 +373,7 @@ func target(srv *servers.Server) sshx.Target {
 
 // connect returns the session's connection, signing in with the panel's key if
 // there is none yet. Every step after the first relies on the key being there.
-func (s *session) connect(ctx context.Context) (*sshx.Client, error) {
+func (s *session) connect(ctx context.Context) (sshx.Remote, error) {
 	if s.client != nil {
 		return s.client, nil
 	}
@@ -375,46 +393,25 @@ func (s *session) connect(ctx context.Context) (*sshx.Client, error) {
 	return client, nil
 }
 
-// sshFailure translates a connection error into the failure the UI explains.
-func sshFailure(err error, srv *servers.Server, key *sshkeys.Key) error {
-	var changed *sshx.HostKeyChangedError
-	switch {
-	case errors.As(err, &changed):
-		return ops.Fail(CodeSSHHostKeyChanged, err.Error(), map[string]any{
-			"expected": changed.Expected.Fingerprint,
-			"got":      changed.Got.Fingerprint,
-			"host_key": changed.Got.Authorized,
-		})
-	case errors.Is(err, sshx.ErrPasswordRejected):
-		return ops.Fail(CodeSSHPasswordRejected, err.Error(), map[string]any{"target": target(srv).String()})
-	case errors.Is(err, sshx.ErrKeyRejected):
-		return ops.Fail(CodeSSHKeyRejected, err.Error(), map[string]any{
-			"target": target(srv).String(), "key_name": key.Name, "public_key": key.PublicKey,
-		})
-	case errors.Is(err, sshx.ErrUnreachable):
-		return ops.Fail(CodeSSHUnreachable, err.Error(), map[string]any{"target": target(srv).String()})
+// dialSSH is the real dialFunc.
+func dialSSH(ctx context.Context, target sshx.Target, auth sshx.Auth, pinned string) (sshx.Remote, error) {
+	client, err := sshx.Dial(ctx, target, auth, pinned)
+	if err != nil {
+		// Not "return client, err": a nil *Client in the interface would not
+		// be a nil interface.
+		return nil, err
 	}
-	return err
+	return client, nil
 }
 
-// commandFailure translates a failed command. The one case worth its own
-// explanation is sudo refusing; everything else keeps its output.
+// sshFailure translates a connection error into the failure the UI explains.
+func sshFailure(err error, srv *servers.Server, key *sshkeys.Key) error {
+	return remote.SSHFailure(err, target(srv), key)
+}
+
+// commandFailure translates a failed command; see remote.CommandFailure.
 func commandFailure(err error, user string) error {
-	var exit *sshx.ExitError
-	if !errors.As(err, &exit) {
-		if errors.Is(err, sshx.ErrUnreachable) {
-			return ops.Fail(CodeSSHUnreachable, err.Error(), nil)
-		}
-		return err
-	}
-	out := exit.Output
-	if strings.Contains(out, "sudo:") &&
-		(strings.Contains(out, "a password is required") || strings.Contains(out, "not in the sudoers") ||
-			strings.Contains(out, "not allowed") || strings.Contains(out, "command not found") ||
-			strings.Contains(out, "a terminal is required")) {
-		return ops.Fail(CodeNoRoot, strings.TrimSpace(out), map[string]any{"user": user})
-	}
-	return err
+	return remote.CommandFailure(err, user)
 }
 
 // sudo runs a root script on the server, logging the command and its output.
@@ -453,6 +450,15 @@ func logCommand(run *ops.Run, script string) {
 	for _, line := range strings.Split(strings.TrimSpace(script), "\n") {
 		run.Cmd(strings.TrimSpace(line))
 	}
+}
+
+// versionCheck is a script that proves the binary at path runs on this server
+// and prints the first line of what it says about itself. The binary is run on
+// a line of its own: piped straight into head, one that cannot start — wrong
+// architecture, a noexec mount — would still exit 0, because a pipeline's
+// status is its last command's.
+func versionCheck(path string) string {
+	return "set -e\nv=$(" + path + " version)\nprintf '%s\\n' \"$v\" | head -n 1"
 }
 
 func logOutput(run *ops.Run, out string) {

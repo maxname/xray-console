@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"xray-console/internal/store"
 )
 
 // Kinds of condition on the destination. A rule matches when any one of its
@@ -366,7 +368,7 @@ func (s *Store) Create(ctx context.Context, set *RuleSet) (*RuleSet, error) {
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		set.Name, set.EntryServerID, string(rules), set.DefaultAction, nullable(set.DefaultChainID), now, now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return nil, ErrNameTaken
 		}
 		return nil, err
@@ -389,7 +391,7 @@ func (s *Store) Update(ctx context.Context, set *RuleSet) error {
 		set.Name, set.EntryServerID, string(rules), set.DefaultAction, nullable(set.DefaultChainID),
 		time.Now().Unix(), set.ID)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return ErrNameTaken
 		}
 		return err

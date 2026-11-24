@@ -60,6 +60,12 @@ func (s *Server) configError(w http.ResponseWriter, r *http.Request, err error) 
 			map[string]any{"key": fieldErr.Key, "reason": fieldErr.Code})
 		return true
 	}
+	var awaiting *install.AwaitingError
+	if errors.As(err, &awaiting) {
+		writeError(w, http.StatusConflict, "upstream_pending", err.Error(),
+			map[string]any{"servers": awaiting.Servers})
+		return true
+	}
 	switch {
 	case errors.Is(err, templates.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", err.Error(), nil)
@@ -69,6 +75,8 @@ func (s *Server) configError(w http.ResponseWriter, r *http.Request, err error) 
 		writeError(w, http.StatusUnprocessableEntity, "invalid_name", err.Error(), nil)
 	case errors.Is(err, templates.ErrInUse):
 		writeError(w, http.StatusConflict, "template_in_use", err.Error(), nil)
+	case errors.Is(err, templates.ErrLast):
+		writeError(w, http.StatusConflict, "last_template", err.Error(), nil)
 	case errors.Is(err, templates.ErrNoVersion):
 		writeError(w, http.StatusNotFound, "not_found", err.Error(), nil)
 	case errors.Is(err, plan.ErrNotInstalled), errors.Is(err, install.ErrNotReady):
@@ -252,18 +260,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
+	// Everything is checked first and written last, in one statement: a
+	// request that is refused halfway must not have moved the server to
+	// another template on its way there.
+	var change servers.Settings
+	templateID := srv.TemplateID
 	if req.TemplateID != nil && *req.TemplateID != srv.TemplateID {
-		if _, err := s.templates.Get(ctx, *req.TemplateID); s.configError(w, r, err) {
-			return
-		}
-		if err := s.servers.SetTemplate(ctx, srv.ID, *req.TemplateID); s.serverError(w, r, err) {
-			return
-		}
-		srv.TemplateID = *req.TemplateID
+		templateID = *req.TemplateID
+		change.TemplateID = &templateID
 	}
 
-	if len(req.Overrides) > 0 {
-		tpl, err := s.templates.Get(ctx, srv.TemplateID)
+	if change.TemplateID != nil || len(req.Overrides) > 0 {
+		tpl, err := s.templates.Get(ctx, templateID)
 		if s.configError(w, r, err) {
 			return
 		}
@@ -289,8 +297,8 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 				overrides[key] = normalized
 			}
 		}
-		if err := s.servers.SetOverrides(ctx, srv.ID, overrides); s.serverError(w, r, err) {
-			return
+		if len(req.Overrides) > 0 {
+			change.Overrides = overrides
 		}
 	}
 
@@ -299,9 +307,10 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		if s.serverError(w, r, inbound.SetMaskHost(*req.MaskHost)) {
 			return
 		}
-		if err := s.servers.SetInbound(ctx, srv.ID, inbound); s.serverError(w, r, err) {
-			return
-		}
+		change.Inbound = inbound
+	}
+	if err := s.servers.SetSettings(ctx, srv.ID, change); s.serverError(w, r, err) {
+		return
 	}
 	s.respondConfig(w, r, srv.ID)
 }

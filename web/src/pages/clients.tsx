@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next'
 import { Field, Notice } from '@/components/auth-layout'
 import { EntryApply } from '@/components/entry-apply'
 import { EmptyState, Page, PageHeader, Panel } from '@/components/page'
+import { Segmented } from '@/components/segmented'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -38,25 +39,23 @@ import {
 } from '@/components/ui/table'
 import {
   api,
-  ApiError,
   type ChainServer,
   type RuleSet,
   type Subscription,
   type SubscriptionRequest,
 } from '@/lib/api'
+import { explainKnown, type Translate } from '@/lib/errors'
+import { copyText } from '@/lib/clipboard'
 import { formatBytes, formatDate, formatDayTime } from '@/lib/format'
 import { clientsPending, devicesKey } from '@/lib/rules'
 import { toast } from '@/lib/toast'
 import { useMe } from '@/lib/use-me'
 import { DevicesPanel, LocalClientPanel } from '@/pages/devices'
 
-type Translate = (key: string, options?: Record<string, unknown>) => string
+const KNOWN_ERRORS = ['invalid_name', 'bad_rule_set'] as const
 
 function explain(t: Translate, error: unknown): string {
-  if (error instanceof ApiError && (error.code === 'invalid_name' || error.code === 'bad_rule_set')) {
-    return t(`clients.errors.${error.code}`)
-  }
-  return t('common.error')
+  return explainKnown(t, error, 'clients', KNOWN_ERRORS)
 }
 
 const subscriptionsKey = ['subscriptions'] as const
@@ -81,8 +80,12 @@ function fromDateInput(value: string): number | null {
 }
 
 function copy(t: Translate, text: string) {
-  void navigator.clipboard.writeText(text).then(() => {
-    toast({ title: t('common.copied'), variant: 'success' })
+  void copyText(text).then((ok) => {
+    toast(
+      ok
+        ? { title: t('common.copied'), variant: 'success' }
+        : { title: t('common.copyFailed'), variant: 'destructive' },
+    )
   })
 }
 
@@ -348,28 +351,16 @@ function LinkDialog({
         </DialogHeader>
 
         {sub.link !== '' && (
-          <div
-            role="tablist"
-            aria-label={t('clients.link.kind')}
-            className="flex gap-1 justify-self-start rounded-lg bg-muted p-1 text-sm"
-          >
-            {(['subscription', 'direct'] as const).map((option) => (
-              <button
-                key={option}
-                type="button"
-                role="tab"
-                aria-selected={kind === option}
-                className={
-                  kind === option
-                    ? 'rounded-md bg-card px-3 py-1.5 text-sm font-medium shadow-sm'
-                    : 'rounded-md px-3 py-1.5 text-sm font-medium text-muted-foreground hover:text-foreground'
-                }
-                onClick={() => setKind(option)}
-              >
-                {t(`clients.link.${option}`)}
-              </button>
-            ))}
-          </div>
+          <Segmented
+            label={t('clients.link.kind')}
+            className="justify-self-start"
+            options={(['subscription', 'direct'] as const).map((option) => ({
+              value: option,
+              label: t(`clients.link.${option}`),
+            }))}
+            value={kind}
+            onChange={setKind}
+          />
         )}
 
         {/* White behind the code in both themes: scanners want dark-on-light. */}

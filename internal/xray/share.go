@@ -19,10 +19,10 @@ func (in *Inbound) ShareLink(address, uuid, name string) string {
 	query.Set("encryption", "none")
 	query.Set("type", "xhttp")
 	query.Set("security", "reality")
-	query.Set("sni", in.ServerNames[0])
+	query.Set("sni", in.MaskHost())
 	query.Set("fp", "chrome")
 	query.Set("pbk", in.PublicKey)
-	query.Set("sid", in.ShortIDs[0])
+	query.Set("sid", in.shortID())
 	query.Set("path", in.XHTTPPath)
 	query.Set("mode", in.XHTTPMode)
 	if in.XHTTPHost != "" {

@@ -32,6 +32,29 @@ type Sweeper struct {
 	// held remembers the servers already reported as "not applied because of
 	// other changes", so that the log says it once and not every minute.
 	held map[int64]bool
+	// tried remembers the servers an apply was started on and is still owed:
+	// when, and how many times in a row. An apply that fails leaves the server
+	// exactly as overdue as before, and every attempt restarts Xray there — so
+	// the next one waits, longer each time, instead of coming a minute later.
+	tried map[int64]attempt
+}
+
+type attempt struct {
+	at    time.Time
+	count int
+}
+
+// retryAfter is how long to leave a server alone after the count-th apply in
+// a row that did not take the subscription off it.
+func retryAfter(count int) time.Duration {
+	switch {
+	case count <= 1:
+		return 15 * time.Minute
+	case count == 2:
+		return time.Hour
+	default:
+		return 6 * time.Hour
+	}
 }
 
 // Sweep finds the servers that still let in a subscription past its end date
@@ -94,10 +117,22 @@ func (w *Sweeper) Sweep(ctx context.Context, now time.Time) ([]int64, error) {
 			delete(w.held, id)
 		}
 	}
+	if w.tried == nil {
+		w.tried = map[int64]attempt{}
+	}
+	for id := range w.tried {
+		if _, still := overdue[id]; !still {
+			delete(w.tried, id)
+		}
+	}
 	var started []int64
 	for _, id := range order {
 		entry := overdue[id]
 		if w.Busy(id) {
+			continue
+		}
+		last, again := w.tried[id]
+		if again && now.Sub(last.at) < retryAfter(last.count) {
 			continue
 		}
 		desired, err := w.Plan(ctx, entry)
@@ -117,7 +152,13 @@ func (w *Sweeper) Sweep(ctx context.Context, now time.Time) ([]int64, error) {
 			w.Log.Warn("could not apply a server after a subscription ended", "server", entry.Name, "err", err)
 			continue
 		}
-		w.Log.Info("a subscription has ended; applying its server", "server", entry.Name)
+		if again {
+			w.Log.Warn("a subscription has ended and the last apply did not take it off its server; applying again",
+				"server", entry.Name, "attempt", last.count+1)
+		} else {
+			w.Log.Info("a subscription has ended; applying its server", "server", entry.Name)
+		}
+		w.tried[id] = attempt{at: now, count: last.count + 1}
 		started = append(started, id)
 	}
 	return started, nil

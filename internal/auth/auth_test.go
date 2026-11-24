@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -330,5 +333,140 @@ func TestResetPassword(t *testing.T) {
 	var invalid *InvalidCredentialsError
 	if _, err := f.login(goodPassword, ""); !errors.As(err, &invalid) {
 		t.Fatalf("old password: got %v", err)
+	}
+}
+
+func TestABurstOfAttemptsDoesNotGetPastTheLimit(t *testing.T) {
+	f := newFixture(t)
+	f.setup(t, false)
+
+	// All at once, as a script would send them: the limit is on attempts, not
+	// on attempts that happened to arrive one after another.
+	const burst = 4 * MaxAttempts
+	var wg sync.WaitGroup
+	var checked, locked atomic.Int32
+	for range burst {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := f.login("wrong password!", "")
+			var invalid *InvalidCredentialsError
+			var lock *LockedError
+			switch {
+			case errors.As(err, &invalid):
+				checked.Add(1)
+			case errors.As(err, &lock):
+				locked.Add(1)
+			default:
+				t.Errorf("got %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	// The last allowed attempt is itself answered with the lock.
+	if n := checked.Load(); n != MaxAttempts-1 {
+		t.Fatalf("%d attempts were answered \"wrong password\", want %d", n, MaxAttempts-1)
+	}
+	if n := locked.Load(); n != burst-MaxAttempts+1 {
+		t.Fatalf("%d attempts were locked out, want %d", n, burst-MaxAttempts+1)
+	}
+}
+
+func TestSetupThatCannotSucceedCostsNoHash(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	token, err := f.SetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := SetupInput{Username: "admin", Password: goodPassword, PanelURL: "https://console.example.net/"}
+
+	// With every hashing slot taken, a request that hashed would wait here
+	// for good; one turned away first comes straight back.
+	answer := func(in SetupInput) error {
+		for range cap(argonSlots) {
+			argonSlots <- struct{}{}
+		}
+		defer func() {
+			for range cap(argonSlots) {
+				<-argonSlots
+			}
+		}()
+		done := make(chan error, 1)
+		go func() {
+			_, err := f.CreateAdmin(ctx, in)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatal("the request went on to hash the password")
+			return nil
+		}
+	}
+
+	wrong := input
+	wrong.Token = "not the token"
+	if err := answer(wrong); !errors.Is(err, ErrBadSetupToken) {
+		t.Fatalf("wrong token: got %v", err)
+	}
+	f.setup(t, false)
+	again := input
+	again.Token = token
+	if err := answer(again); !errors.Is(err, ErrAlreadySetUp) {
+		t.Fatalf("after setup: got %v", err)
+	}
+}
+
+func TestASessionKeptAliveStillEndsAfterAWeek(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.setup(t, false)
+	session, err := f.CreateSession(ctx, "203.0.113.80", "test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := f.clock
+	// Used every few hours, as a stolen cookie in a script would be.
+	for f.clock.Sub(started) < SessionMax-SessionIdle {
+		f.clock = f.clock.Add(SessionIdle / 2)
+		if ok, _ := f.Authenticate(ctx, session.Token); !ok {
+			t.Fatalf("session ended after %s of use", f.clock.Sub(started))
+		}
+	}
+	for f.clock.Sub(started) <= SessionMax {
+		f.clock = f.clock.Add(SessionIdle / 2)
+		_, _ = f.Authenticate(ctx, session.Token)
+	}
+	if ok, _ := f.Authenticate(ctx, session.Token); ok {
+		t.Fatalf("a session in use is still alive after %s", f.clock.Sub(started))
+	}
+}
+
+func TestFailuresAreCountedAcrossAnIPv6Network(t *testing.T) {
+	f := newFixture(t)
+	f.setup(t, false)
+	attempt := func(ip, password string) error {
+		_, err := f.Login(context.Background(), LoginInput{Username: "admin", Password: password, IP: ip})
+		return err
+	}
+	// A new address out of the same /64 for every attempt: one customer.
+	for i := 1; i < MaxAttempts; i++ {
+		var invalid *InvalidCredentialsError
+		if err := attempt(fmt.Sprintf("2001:db8:1:2::%x", i), "wrong password!"); !errors.As(err, &invalid) {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+	var locked *LockedError
+	if err := attempt("2001:db8:1:2::ff", "wrong password!"); !errors.As(err, &locked) {
+		t.Fatalf("the attempt past the limit, from a fresh address of the same network: %v", err)
+	}
+	if err := attempt("2001:db8:1:2:aaaa::1", goodPassword); !errors.As(err, &locked) {
+		t.Fatalf("the right password from the locked network: %v", err)
+	}
+	// The network next door is somebody else.
+	if err := attempt("2001:db8:1:3::1", goodPassword); err != nil {
+		t.Fatalf("another network: %v", err)
 	}
 }

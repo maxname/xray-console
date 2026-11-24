@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { Check, Copy } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field } from '@/components/auth-layout'
@@ -16,6 +16,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { api } from '@/lib/api'
+import { useCopy } from '@/lib/clipboard'
 import type { InstallFormState } from '@/lib/install-form'
 import { cn } from '@/lib/utils'
 
@@ -196,14 +197,8 @@ function RadioCard({
 /** Monospace text with a copy button — keys, commands, logs. */
 export function CopyBlock({ text, className }: { text: string; className?: string }) {
   const { t } = useTranslation()
-  const [copied, setCopied] = useState(false)
-
-  const copy = () => {
-    void navigator.clipboard.writeText(text).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    })
-  }
+  const { copied, copy: copyText } = useCopy()
+  const copy = () => copyText(text)
 
   return (
     <div className={cn('flex items-start gap-2 rounded-lg bg-muted p-2.5', className)}>

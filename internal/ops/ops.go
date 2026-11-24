@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -66,6 +67,7 @@ const (
 	CodeCancelled   = "cancelled"
 	CodeInternal    = "internal"
 	CodeInterrupted = "interrupted"
+	CodeTimeout     = "timeout"
 )
 
 type Operation struct {
@@ -97,7 +99,15 @@ type Step struct {
 	ID   string
 	Run  func(ctx context.Context, run *Run) error
 	Undo func(ctx context.Context, run *Run) error
+	// Timeout is how long Run may take; DefaultStepTimeout when zero.
+	Timeout time.Duration
 }
+
+// DefaultStepTimeout bounds a step that sets no limit of its own. No step
+// takes anywhere near this long; one that does is stuck — a command waiting
+// on something that will not come — and a stuck step holds its server, which
+// then refuses every other job, until somebody notices and cancels it.
+const DefaultStepTimeout = 15 * time.Minute
 
 var (
 	ErrNotFound = errors.New("operation not found")
@@ -197,8 +207,15 @@ func (m *Manager) ListForServer(ctx context.Context, serverID int64, limit int) 
 }
 
 // RecoverInterrupted marks jobs that were running when the panel last stopped
-// as failed. Their steps are resumable, so the administrator can retry.
-func (m *Manager) RecoverInterrupted(ctx context.Context) error {
+// as failed, and returns them. Their steps are resumable, so the
+// administrator can retry.
+func (m *Manager) RecoverInterrupted(ctx context.Context) ([]*Operation, error) {
+	var cut []*Operation
+	err := m.recoverInterrupted(ctx, &cut)
+	return cut, err
+}
+
+func (m *Manager) recoverInterrupted(ctx context.Context, cut *[]*Operation) error {
 	rows, err := m.db.QueryContext(ctx, `SELECT id FROM operations WHERE status = ?`, StatusRunning)
 	if err != nil {
 		return err
@@ -233,6 +250,7 @@ func (m *Manager) RecoverInterrupted(ctx context.Context) error {
 		if err := m.save(ctx, op); err != nil {
 			return err
 		}
+		*cut = append(*cut, op)
 	}
 	return nil
 }
@@ -269,6 +287,17 @@ func (m *Manager) Create(ctx context.Context, serverID int64, kind string, stepI
 func (m *Manager) Get(ctx context.Context, id int64) (*Operation, error) {
 	return m.scan(m.db.QueryRowContext(ctx, `SELECT id, server_id, kind, status, steps, error,
 		params, result, started_at, finished_at FROM operations WHERE id = ?`, id))
+}
+
+// Prune deletes jobs that finished before the cutoff, logs with them. Each
+// server's most recent job stays whatever its age: it is what the server's
+// page shows.
+func (m *Manager) Prune(ctx context.Context, before time.Time) error {
+	_, err := m.db.ExecContext(ctx, `DELETE FROM operations
+		WHERE status != ? AND finished_at IS NOT NULL AND finished_at < ?
+		AND id NOT IN (SELECT MAX(id) FROM operations GROUP BY server_id)`,
+		StatusRunning, before.Unix())
+	return err
 }
 
 // LatestForServer returns the server's most recent job, or ErrNotFound.
@@ -361,7 +390,14 @@ func (m *Manager) Log(ctx context.Context, id, after int64) ([]LogLine, error) {
 	return lines, rows.Err()
 }
 
+// maxLogLine bounds one line of a job's log. Lines are what a server printed,
+// and a server can print anything; the log is stored and sent to the browser.
+const maxLogLine = 8 << 10
+
 func (m *Manager) appendLog(id int64, step, kind, text string) {
+	if len(text) > maxLogLine {
+		text = strings.ToValidUTF8(text[:maxLogLine], "") + " … (cut)"
+	}
 	// A background context: a line about a cancelled job must still be written.
 	if _, err := m.db.ExecContext(context.Background(), `INSERT INTO operation_log
 		(operation_id, at, step, kind, text) VALUES (?, ?, ?, ?, ?)`,
@@ -495,10 +531,13 @@ func (m *Manager) Execute(id int64, steps []Step, finish func(*Operation)) error
 	go func() {
 		defer m.wg.Done()
 		m.execute(ctx, op, steps)
-		m.release(op)
+		// finish first: until it has run the server's own state is not
+		// settled, and nothing else may start on that server or be told the
+		// job is over.
 		if finish != nil {
 			finish(op)
 		}
+		m.release(op)
 	}()
 	return nil
 }
@@ -521,11 +560,28 @@ func (m *Manager) execute(ctx context.Context, op *Operation, steps []Step) {
 		persist()
 
 		run := &Run{m: m, op: op, step: state}
-		err := safely(func() error { return steps[i].Run(ctx, run) })
+		limit := steps[i].Timeout
+		if limit <= 0 {
+			limit = DefaultStepTimeout
+		}
+		stepCtx, cancel := context.WithTimeout(ctx, limit)
+		err := safely(func() error { return steps[i].Run(stepCtx, run) })
+		timedOut := stepCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		cancel()
 		state.FinishedAt = time.Now().Unix()
 
 		if err != nil {
 			failure := m.asFailure(ctx, op.ID, err)
+			if timedOut {
+				// Whatever it surfaced as, the cause is the clock. What the
+				// step reported on its way out — "restored" — is kept.
+				failure.Code = CodeTimeout
+				failure.Message = fmt.Sprintf("the step did not finish in %s", limit)
+				if failure.Details == nil {
+					failure.Details = map[string]any{}
+				}
+				failure.Details["minutes"] = int(limit / time.Minute)
+			}
 			failure.Step = state.ID
 			state.Status = StepFailed
 			op.Status, op.Error, op.FinishedAt = StatusFailed, failure, time.Now()
@@ -568,10 +624,10 @@ func (m *Manager) Rollback(id int64, steps []Step, finish func(*Operation)) erro
 	go func() {
 		defer m.wg.Done()
 		m.rollback(ctx, op, steps)
-		m.release(op)
 		if finish != nil {
 			finish(op)
 		}
+		m.release(op)
 	}()
 	return nil
 }
@@ -635,13 +691,19 @@ func safely(fn func() error) (err error) {
 func (m *Manager) asFailure(ctx context.Context, id int64, err error) *Failure {
 	// A cancelled context wins over whatever error it surfaced as: "connection
 	// closed" is the symptom of being stopped, not the cause.
-	if ctx.Err() != nil {
-		if m.wasStopped(id) {
-			return &Failure{Code: CodeCancelled, Message: "stopped by the administrator"}
-		}
-		return &Failure{Code: CodeInterrupted, Message: "the panel was shut down while this was running"}
-	}
 	var failure *Failure
+	if ctx.Err() != nil {
+		// What the step managed to report while stopping — whether it put
+		// things back — is the one thing worth keeping from its own error.
+		var details map[string]any
+		if errors.As(err, &failure) {
+			details = failure.Details
+		}
+		if m.wasStopped(id) {
+			return &Failure{Code: CodeCancelled, Message: "stopped by the administrator", Details: details}
+		}
+		return &Failure{Code: CodeInterrupted, Message: "the panel was shut down while this was running", Details: details}
+	}
 	if errors.As(err, &failure) {
 		// Copy: the step may have returned a shared value.
 		copied := *failure

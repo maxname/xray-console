@@ -38,6 +38,7 @@ import {
   isKnownFormError,
   toInstallOptions,
 } from '@/lib/install-form'
+import { useCopy } from '@/lib/clipboard'
 import { explained } from '@/lib/failures'
 import { toast } from '@/lib/toast'
 import { cn } from '@/lib/utils'
@@ -250,19 +251,14 @@ export function LogView({ lines, follow }: { lines: LogLine[]; follow: boolean }
 
 function CopyLogButton({ text }: { text: string }) {
   const { t } = useTranslation()
-  const [copied, setCopied] = useState(false)
+  const { copied, copy } = useCopy()
   return (
     <Button
       type="button"
       variant="outline"
       size="sm"
       className="self-start"
-      onClick={() => {
-        void navigator.clipboard.writeText(text).then(() => {
-          setCopied(true)
-          setTimeout(() => setCopied(false), 2000)
-        })
-      }}
+      onClick={() => copy(text)}
     >
       {copied ? t('common.copied') : t('server.log.copy')}
     </Button>
@@ -689,6 +685,18 @@ export function DeleteDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        {/* The form lives only while the dialog is open: a name typed and then
+            cancelled must not be waiting there, button armed, the next time. */}
+        <DeleteForm server={server} onClose={() => onOpenChange(false)} />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function DeleteForm({ server, onClose }: { server: Server; onClose: () => void }) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -742,53 +750,49 @@ export function DeleteDialog({
   })()
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <form
-          className="grid gap-4"
-          onSubmit={(event) => {
-            event.preventDefault()
-            remove.mutate()
-          }}
+    <form
+      className="grid gap-4"
+      onSubmit={(event) => {
+        event.preventDefault()
+        remove.mutate()
+      }}
+    >
+      <DialogHeader>
+        <DialogTitle>{t('server.deleteDialog.title', { name: server.name })}</DialogTitle>
+        <DialogDescription>
+          {server.status === 'ready'
+            ? t('server.deleteDialog.description')
+            : t('server.deleteDialog.descriptionFresh')}
+          {hasAccess && ` ${t('server.deleteDialog.access')}`}
+        </DialogDescription>
+      </DialogHeader>
+      <Field>
+        <Label htmlFor="delete-server-name">{t('server.deleteDialog.confirm')}</Label>
+        <Input
+          id="delete-server-name"
+          className="font-mono"
+          placeholder={server.name}
+          autoComplete="off"
+          spellCheck={false}
+          value={typed}
+          onChange={(event) => setTyped(event.target.value)}
+        />
+      </Field>
+      {error !== null && <Notice title={error} />}
+      <DialogFooter>
+        <Button type="button" variant="outline" onClick={onClose}>
+          {t('common.cancel')}
+        </Button>
+        <Button
+          type="submit"
+          variant="destructive"
+          disabled={typed !== server.name || remove.isPending}
         >
-          <DialogHeader>
-            <DialogTitle>{t('server.deleteDialog.title', { name: server.name })}</DialogTitle>
-            <DialogDescription>
-              {server.status === 'ready'
-                ? t('server.deleteDialog.description')
-                : t('server.deleteDialog.descriptionFresh')}
-              {hasAccess && ` ${t('server.deleteDialog.access')}`}
-            </DialogDescription>
-          </DialogHeader>
-          <Field>
-            <Label htmlFor="delete-server-name">{t('server.deleteDialog.confirm')}</Label>
-            <Input
-              id="delete-server-name"
-              className="font-mono"
-              placeholder={server.name}
-              autoComplete="off"
-              spellCheck={false}
-              value={typed}
-              onChange={(event) => setTyped(event.target.value)}
-            />
-          </Field>
-          {error !== null && <Notice title={error} />}
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {t('common.cancel')}
-            </Button>
-            <Button
-              type="submit"
-              variant="destructive"
-              disabled={typed !== server.name || remove.isPending}
-            >
-              {remove.isPending
-                ? t('server.deleteDialog.submitting')
-                : t('server.deleteDialog.submit')}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+          {remove.isPending
+            ? t('server.deleteDialog.submitting')
+            : t('server.deleteDialog.submit')}
+        </Button>
+      </DialogFooter>
+    </form>
   )
 }

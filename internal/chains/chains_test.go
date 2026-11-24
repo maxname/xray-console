@@ -135,3 +135,11 @@ func TestUsersAreStableAcrossEditsAndDifferPerServerAndChain(t *testing.T) {
 		t.Fatalf("server 2 left the chain but is still reported in %d", len(used))
 	}
 }
+
+func TestAChainWithNoFirstLinkHasNoEntryAndDoesNotPanic(t *testing.T) {
+	for _, chain := range []*Chain{{}, {Hops: []Hop{{}}}} {
+		if got := chain.Entry(); got != 0 {
+			t.Fatalf("entry of %+v = %d, want 0", chain.Hops, got)
+		}
+	}
+}

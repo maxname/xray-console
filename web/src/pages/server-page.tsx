@@ -14,10 +14,13 @@ export function ServerPage() {
   const { t } = useTranslation()
   const params = useParams({ strict: false })
   const id = Number(params.serverId)
+  // "/servers/abc" is no server; asking the API for it would only add noise.
+  const valid = Number.isInteger(id) && id > 0
 
   const serverQuery = useQuery({
     queryKey: ['servers', id],
     queryFn: () => api.getServer(id),
+    enabled: valid,
     retry: false,
     // While a job runs the server's own record changes under us.
     refetchInterval: (q) =>
@@ -38,9 +41,9 @@ export function ServerPage() {
       q.state.data?.operation.status === 'running' ? 1000 : false,
   })
 
-  if (serverQuery.isError) {
+  if (!valid || serverQuery.isError) {
     const missing =
-      serverQuery.error instanceof ApiError && serverQuery.error.status === 404
+      !valid || (serverQuery.error instanceof ApiError && serverQuery.error.status === 404)
     // The last thing known about a server that has just vanished is that
     // Xray was being removed from it: that is the removal finishing, not a
     // wrong address.
@@ -74,7 +77,23 @@ export function ServerPage() {
     )
   }
 
-  if (!server || (operationId !== null && !feedQuery.data)) {
+  // The job's record did not load. A server that is ready is shown without
+  // it; one in the middle of a job is nothing but that job, so say so and
+  // offer to ask again, instead of a placeholder that never goes away.
+  if (server && feedQuery.isError && !feedQuery.data && server.status !== 'ready') {
+    return (
+      <Page>
+        <PageHeader title={server.name} />
+        <EmptyState title={t('servers.loadFailedTitle')} description={t('servers.loadFailed')}>
+          <Button variant="outline" onClick={() => void feedQuery.refetch()}>
+            {t('common.retry')}
+          </Button>
+        </EmptyState>
+      </Page>
+    )
+  }
+
+  if (!server || (operationId !== null && !feedQuery.data && !feedQuery.isError)) {
     return (
       <Page>
         <PageHeader title={server?.name ?? '…'} />

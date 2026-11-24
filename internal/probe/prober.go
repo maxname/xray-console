@@ -80,10 +80,16 @@ func checkServer(ctx context.Context, host string, srv *servers.Server, target *
 func (p *Prober) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.Interval)
 	defer ticker.Stop()
+	var pruned time.Time
 	for {
 		p.RunOnce(ctx)
-		if err := p.Store.Prune(ctx, KeepResults, p.now()); err != nil && ctx.Err() == nil {
-			p.Log.Warn("could not prune check results", "err", err)
+		// Old results go once an hour, not once a round: it is a pass over
+		// the whole history either way.
+		if now := p.now(); now.Sub(pruned) >= time.Hour {
+			pruned = now
+			if err := p.Store.Prune(ctx, KeepResults, now); err != nil && ctx.Err() == nil {
+				p.Log.Warn("could not prune check results", "err", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -119,6 +125,7 @@ func (p *Prober) RunOnce(ctx context.Context) {
 			defer wg.Done()
 			slots <- struct{}{}
 			defer func() { <-slots }()
+			defer p.survive("server", srv.Name)
 			p.checkOne(ctx, srv)
 		}()
 	}
@@ -143,19 +150,40 @@ func (p *Prober) checkChains(ctx context.Context, all []*servers.Server) {
 	for _, srv := range all {
 		byID[srv.ID] = srv
 	}
+	// Side by side, like the servers: a chain that does not answer takes its
+	// whole timeout, and one after another a few of those are the round.
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, parallel)
 	for _, chain := range list {
-		if ctx.Err() != nil {
-			return
-		}
-		result, ok := p.CheckChain(ctx, chain, byID)
-		if !ok {
-			continue
-		}
-		if err := p.Chains.SetCheck(ctx, chain.ID, chains.Check{
-			OK: result.OK, At: p.now(), Ms: result.RequestMs, Error: result.Error,
-		}); err != nil && ctx.Err() == nil {
-			p.Log.Warn("could not record a chain check", "chain", chain.Name, "err", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			defer p.survive("chain", chain.Name)
+			if ctx.Err() != nil {
+				return
+			}
+			result, ok := p.CheckChain(ctx, chain, byID)
+			if !ok || ctx.Err() != nil {
+				return
+			}
+			if err := p.Chains.SetCheck(ctx, chain.ID, chains.Check{
+				OK: result.OK, At: p.now(), Ms: result.RequestMs, Error: result.Error,
+			}); err != nil && ctx.Err() == nil {
+				p.Log.Warn("could not record a chain check", "chain", chain.Name, "err", err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// survive keeps one check that panics — a stored row that does not hold what
+// it should — from taking the whole panel down with it: this runs in a
+// goroutine of its own, where a panic is nobody else's to catch.
+func (p *Prober) survive(what, name string) {
+	if rec := recover(); rec != nil {
+		p.Log.Error("a check panicked", what, name, "panic", rec)
 	}
 }
 

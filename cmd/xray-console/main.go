@@ -131,6 +131,15 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The panel is made to sit behind a reverse proxy on its own machine. A
+	// panel that listens only there can be reached by nothing else, so the
+	// proxy is believed without being named: left unnamed it would make every
+	// visitor the same address — one lockout for all — and the session
+	// cookie would go out without "Secure".
+	proxyAssumed := false
+	if len(trusted) == 0 && config.ListensOnLoopback(*listen) {
+		trusted, proxyAssumed = config.Loopback(), true
+	}
 	cfg := config.Config{Listen: *listen, DataDir: *dataDir, TrustedProxies: trusted}
 
 	level := slog.LevelInfo
@@ -159,7 +168,8 @@ func runServe(args []string) error {
 	jobsCtx, stopJobs := context.WithCancel(context.Background())
 	defer stopJobs()
 	manager := ops.NewManager(jobsCtx, db, logger)
-	if err := manager.RecoverInterrupted(ctx); err != nil {
+	interrupted, err := manager.RecoverInterrupted(ctx)
+	if err != nil {
 		return err
 	}
 	serverStore := servers.NewStore(db, box)
@@ -249,6 +259,7 @@ func runServe(args []string) error {
 	if err := recoverServers(ctx, serverStore); err != nil {
 		return err
 	}
+	installer.Interrupted(ctx, interrupted)
 
 	server := &http.Server{
 		Handler: httpapi.New(httpapi.Options{
@@ -277,7 +288,11 @@ func runServe(args []string) error {
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
+		// The slowest answers — a round of checks, a journal read over SSH —
+		// take a minute or so; nothing takes this long honestly.
+		WriteTimeout:   3 * time.Minute,
+		IdleTimeout:    2 * time.Minute,
+		MaxHeaderBytes: 64 << 10,
 	}
 
 	// Listen before announcing: the setup link below must not be printed for a
@@ -287,12 +302,20 @@ func runServe(args []string) error {
 		return err
 	}
 	logger.Info("panel is listening", "addr", listener.Addr().String(), "version", version, "data", cfg.DataDir)
+	switch {
+	case proxyAssumed:
+		logger.Info("listening on this machine only: a reverse proxy here is believed about who is asking and over what (X-Forwarded-For, X-Forwarded-Proto); it must set both")
+	case !config.ListensOnLoopback(cfg.Listen) && len(cfg.TrustedProxies) == 0:
+		logger.Warn("the panel is reachable from other machines over plain HTTP: passwords, and the root passwords of servers being added, travel unencrypted. Listen on 127.0.0.1 and put a reverse proxy with TLS in front")
+	case !config.ListensOnLoopback(cfg.Listen):
+		logger.Warn("the panel is reachable from other machines over plain HTTP, not only by its reverse proxy: make sure nothing but the proxy can connect to this port")
+	}
 
 	if err := announceSetup(ctx, authService, listener.Addr()); err != nil {
 		return err
 	}
 
-	go pruneLoop(ctx, authService, eventStore, logger)
+	go pruneLoop(ctx, authService, eventStore, manager, logger)
 	// Checks stop with the panel, not with a request: same lifetime as jobs.
 	go prober.Run(jobsCtx)
 	go sweeper.Run(jobsCtx)
@@ -360,7 +383,7 @@ func announceSetup(ctx context.Context, authService *auth.Service, addr net.Addr
 	fmt.Fprintf(os.Stderr, `
   Администратор ещё не создан. Откройте ссылку и задайте имя и пароль:
 
-    http://%s:%s/setup?token=%s
+    http://%s:%s/setup#token=%s
 
   Ссылка одноразовая. Код из неё: %s
 
@@ -368,7 +391,11 @@ func announceSetup(ctx context.Context, authService *auth.Service, addr net.Addr
 	return nil
 }
 
-func pruneLoop(ctx context.Context, authService *auth.Service, eventStore *events.Store, logger *slog.Logger) {
+// keptOperations is how long a finished job and its log stay, like the
+// checks' own history.
+const keptOperations = 90 * 24 * time.Hour
+
+func pruneLoop(ctx context.Context, authService *auth.Service, eventStore *events.Store, jobs *ops.Manager, logger *slog.Logger) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
@@ -377,6 +404,9 @@ func pruneLoop(ctx context.Context, authService *auth.Service, eventStore *event
 		}
 		if err := eventStore.Prune(ctx); err != nil && ctx.Err() == nil {
 			logger.Warn("could not prune events", "err", err)
+		}
+		if err := jobs.Prune(ctx, time.Now().Add(-keptOperations)); err != nil && ctx.Err() == nil {
+			logger.Warn("could not prune finished jobs", "err", err)
 		}
 		select {
 		case <-ctx.Done():

@@ -330,3 +330,81 @@ func TestRoutingEndpointsNeedASessionAndTheLinkDoesNot(t *testing.T) {
 		t.Errorf("unknown link: %d %q", status, body)
 	}
 }
+
+func TestASettingsEditThatIsRefusedChangesNothing(t *testing.T) {
+	h := newHarness(t)
+	h.setup()
+	srv := h.readyServer("entry")
+	path := "/api/servers/" + num(srv.ID) + "/config"
+	templateOf := func() float64 {
+		t.Helper()
+		got := h.do("GET", path, nil)
+		tpl, _ := got.body["template"].(map[string]any)
+		id, _ := tpl["id"].(float64)
+		if got.status != http.StatusOK || id == 0 {
+			t.Fatalf("config: %d %s", got.status, got.raw)
+		}
+		return id
+	}
+	before := templateOf()
+
+	created := h.do("POST", "/api/templates", map[string]any{"name": "relay"})
+	if created.status != http.StatusCreated {
+		t.Fatalf("create template: %d %s", created.status, created.raw)
+	}
+	other := created.body["template"].(map[string]any)["id"].(float64)
+
+	// Another template and a value that is refused, in one request: the
+	// refusal is of all of it, not of everything after the template.
+	bad := h.do("PUT", path, map[string]any{
+		"template_id": other, "overrides": map[string]any{"xhttp.mode": "sideways"},
+	})
+	if bad.status != http.StatusUnprocessableEntity || bad.errorCode() != "invalid_field" {
+		t.Fatalf("a bad value with a template change: %d %s", bad.status, bad.raw)
+	}
+	if got := templateOf(); got != before {
+		t.Fatalf("the refused request moved the server to template %v (was %v)", got, before)
+	}
+
+	// The same change with a good value goes through whole.
+	good := h.do("PUT", path, map[string]any{
+		"template_id": other, "overrides": map[string]any{"xhttp.mode": "packet-up"},
+	})
+	if good.status != http.StatusOK {
+		t.Fatalf("a good change: %d %s", good.status, good.raw)
+	}
+	if got := templateOf(); got != other {
+		t.Fatalf("template after the change: %v, want %v", got, other)
+	}
+}
+
+func TestALinkOfAChainIsNotAppliedBeforeTheNextOne(t *testing.T) {
+	h := newHarness(t)
+	h.setup()
+	entry, exit := h.readyServer("entry"), h.readyServer("exit")
+	chain := h.do("POST", "/api/chains", map[string]any{
+		"name": "Европа", "hops": []map[string]any{{"servers": []int64{entry.ID}}, {"servers": []int64{exit.ID}}},
+	})
+	if chain.status != http.StatusCreated {
+		t.Fatalf("chain: %d %s", chain.status, chain.raw)
+	}
+
+	// The exit is to take connections differently and has not been told yet.
+	edit := h.do("PUT", "/api/servers/"+num(exit.ID)+"/config", map[string]any{
+		"overrides": map[string]any{"xhttp.xPaddingBytes": "200-900"},
+	})
+	if edit.status != http.StatusOK {
+		t.Fatalf("edit the exit: %d %s", edit.status, edit.raw)
+	}
+
+	// The entry's new configuration already dials the exit the new way:
+	// applied first, it would send the chain's traffic to a door that is not
+	// there yet.
+	refused := h.do("POST", "/api/servers/"+num(entry.ID)+"/config/apply", nil)
+	if refused.status != http.StatusConflict || refused.errorCode() != "upstream_pending" {
+		t.Fatalf("applying the entry first: %d %s", refused.status, refused.raw)
+	}
+	if first, _ := refused.details()["servers"].([]any); len(first) != 1 || first[0] != "exit" {
+		t.Fatalf("which servers to apply first: %v", refused.details()["servers"])
+	}
+}

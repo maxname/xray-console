@@ -24,7 +24,8 @@ import {
   type OperationFeed,
   type Server,
 } from '@/lib/api'
-import { explained } from '@/lib/failures'
+import { explainKnown, type Translate } from '@/lib/errors'
+import { aftermath, explained } from '@/lib/failures'
 import { toast } from '@/lib/toast'
 import { releaseKey, useRelease } from '@/lib/use-release'
 import { cn } from '@/lib/utils'
@@ -35,8 +36,6 @@ import {
   LogView,
   StepList,
 } from '@/pages/server'
-
-type Translate = (key: string, options?: Record<string, unknown>) => string
 
 /** What a failed job says went wrong, in the words the installation uses. */
 function FailureText({ operation }: { operation: Operation }) {
@@ -77,10 +76,7 @@ function FailureText({ operation }: { operation: Operation }) {
 const UPDATE_REFUSALS = ['busy', 'up_to_date', 'release_unknown', 'not_installed'] as const
 
 function explainUpdate(t: Translate, error: unknown): string {
-  if (error instanceof ApiError && (UPDATE_REFUSALS as readonly string[]).includes(error.code)) {
-    return t(`update.errors.${error.code}`)
-  }
-  return t('common.error')
+  return explainKnown(t, error, 'update', UPDATE_REFUSALS)
 }
 
 /**
@@ -172,20 +168,15 @@ export function UpdateStatus({ server, feed }: { server: Server; feed: Operation
   if (operation.status !== 'failed' || operation.error === null || dismissed === operation.id) {
     return null
   }
-  // Unless the job says otherwise, assume the worst is not the case only when
-  // it explicitly reported restoring.
-  const restored = operation.error.details?.restored !== false
+  // Only what the job itself reported: see aftermath.
+  const left = aftermath(operation.error.details)
   return (
     <Panel className="border border-destructive/40 bg-destructive/5">
       <div className="flex flex-col gap-1">
         <h2 className="font-heading text-base font-semibold text-destructive">
-          {restored ? t('update.failed.titleRestored') : t('update.failed.titleNotRestored')}
+          {t(`update.failed.title.${left}`)}
         </h2>
-        <p>
-          {restored
-            ? t('update.failed.restored', { name: server.name, ...versions })
-            : t('update.failed.notRestored', { name: server.name, ...versions })}
-        </p>
+        <p>{t(`update.failed.${left}`, { name: server.name, ...versions })}</p>
       </div>
       <FailureText operation={operation} />
       <Button variant="outline" className="self-start" onClick={() => setDismissed(operation.id)}>
@@ -334,6 +325,18 @@ export function UninstallDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        {/* The form lives only while the dialog is open: a name typed and then
+            cancelled must not be waiting there, button armed, the next time. */}
+        <UninstallForm server={server} onClose={() => onOpenChange(false)} />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function UninstallForm({ server, onClose }: { server: Server; onClose: () => void }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const [typed, setTyped] = useState('')
@@ -342,7 +345,7 @@ export function UninstallDialog({
   const start = useMutation({
     mutationFn: () => api.uninstallServer(server.id, { name: typed, remove_backups: removeBackups }),
     onSuccess: () => {
-      onOpenChange(false)
+      onClose()
       // The server's page becomes the removal's page.
       void queryClient.invalidateQueries({ queryKey: ['servers'] })
     },
@@ -378,63 +381,59 @@ export function UninstallDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-xl">
-        <form className="grid gap-4 text-sm" onSubmit={handleSubmit}>
-          <DialogHeader>
-            <DialogTitle>{t('uninstall.dialog.title', { name: server.name })}</DialogTitle>
-            <DialogDescription>{t('uninstall.dialog.description')}</DialogDescription>
-          </DialogHeader>
+    <form className="grid gap-4 text-sm" onSubmit={handleSubmit}>
+      <DialogHeader>
+        <DialogTitle>{t('uninstall.dialog.title', { name: server.name })}</DialogTitle>
+        <DialogDescription>{t('uninstall.dialog.description')}</DialogDescription>
+      </DialogHeader>
 
-          <div className="flex flex-col gap-2">
-            <span className="font-medium">{t('uninstall.dialog.removed')}</span>
-            <ChangeList changes={server.manifest} />
-            <span className="text-xs text-muted-foreground">{t('uninstall.dialog.onlyOwn')}</span>
-          </div>
+      <div className="flex flex-col gap-2">
+        <span className="font-medium">{t('uninstall.dialog.removed')}</span>
+        <ChangeList changes={server.manifest} />
+        <span className="text-xs text-muted-foreground">{t('uninstall.dialog.onlyOwn')}</span>
+      </div>
 
-          <label className="flex cursor-pointer items-start gap-2">
-            <input
-              type="checkbox"
-              className="mt-0.5 size-4 accent-primary"
-              checked={removeBackups}
-              onChange={(event) => setRemoveBackups(event.target.checked)}
-            />
-            <span className="flex flex-col">
-              <span>{t('uninstall.dialog.backups')}</span>
-              <span className="text-xs text-muted-foreground">
-                {t('uninstall.dialog.backupsHint', { path: BACKUP_DIR })}
-              </span>
-            </span>
-          </label>
+      <label className="flex cursor-pointer items-start gap-2">
+        <input
+          type="checkbox"
+          className="mt-0.5 size-4 accent-primary"
+          checked={removeBackups}
+          onChange={(event) => setRemoveBackups(event.target.checked)}
+        />
+        <span className="flex flex-col">
+          <span>{t('uninstall.dialog.backups')}</span>
+          <span className="text-xs text-muted-foreground">
+            {t('uninstall.dialog.backupsHint', { path: BACKUP_DIR })}
+          </span>
+        </span>
+      </label>
 
-          <Field>
-            <Label htmlFor="uninstall-server-name">{t('server.deleteDialog.confirm')}</Label>
-            <Input
-              id="uninstall-server-name"
-              className="font-mono"
-              placeholder={server.name}
-              autoComplete="off"
-              spellCheck={false}
-              value={typed}
-              onChange={(event) => setTyped(event.target.value)}
-            />
-          </Field>
-          {error !== null && <Notice title={error} />}
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {t('common.cancel')}
-            </Button>
-            <Button
-              type="submit"
-              variant="destructive"
-              disabled={typed !== server.name || start.isPending}
-            >
-              {start.isPending ? t('uninstall.dialog.starting') : t('uninstall.dialog.submit')}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+      <Field>
+        <Label htmlFor="uninstall-server-name">{t('server.deleteDialog.confirm')}</Label>
+        <Input
+          id="uninstall-server-name"
+          className="font-mono"
+          placeholder={server.name}
+          autoComplete="off"
+          spellCheck={false}
+          value={typed}
+          onChange={(event) => setTyped(event.target.value)}
+        />
+      </Field>
+      {error !== null && <Notice title={error} />}
+      <DialogFooter>
+        <Button type="button" variant="outline" onClick={onClose}>
+          {t('common.cancel')}
+        </Button>
+        <Button
+          type="submit"
+          variant="destructive"
+          disabled={typed !== server.name || start.isPending}
+        >
+          {start.isPending ? t('uninstall.dialog.starting') : t('uninstall.dialog.submit')}
+        </Button>
+      </DialogFooter>
+    </form>
   )
 }
 

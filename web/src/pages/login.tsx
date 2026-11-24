@@ -58,8 +58,9 @@ export function LoginPage() {
       ? (apiError.details as unknown as LockedDetails)
       : null
   // The first "a code is required" answer is a prompt, not a failure.
+  const rateLimited = apiError?.code === 'rate_limited'
   const otherError = error !== null && invalid === null && locked === null &&
-    apiError?.code !== 'totp_required'
+    !rateLimited && apiError?.code !== 'totp_required'
 
   const clientIp = invalid?.client_ip ?? locked?.client_ip
 
@@ -81,6 +82,7 @@ export function LoginPage() {
             })}
           </Notice>
         )}
+        {rateLimited && <Notice title={t('login.rateLimited')} />}
         {otherError && (
           <Notice title={t('login.unavailableTitle')}>{t('login.unavailable')}</Notice>
         )}

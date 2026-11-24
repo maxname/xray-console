@@ -37,6 +37,8 @@ import {
   type ServerConfig,
   type UpdateConfigRequest,
 } from '@/lib/api'
+import { useCopy } from '@/lib/clipboard'
+import { aftermath } from '@/lib/failures'
 import { formatDayTime } from '@/lib/format'
 import { toast } from '@/lib/toast'
 import { cn } from '@/lib/utils'
@@ -434,6 +436,11 @@ function SettingsTab({ server, feed }: { server: Server; feed: OperationFeed | n
 }
 
 /** Turns a failed save into a sentence. */
+/** The servers an error names, as a list to read. */
+function serverNames(value: unknown): string {
+  return Array.isArray(value) ? value.filter((name) => typeof name === 'string').join(', ') : ''
+}
+
 function explain(
   t: (key: string, options?: Record<string, unknown>) => string,
   error: unknown,
@@ -445,6 +452,9 @@ function explain(
     }
     if (error.code === 'invalid_mask_host' || error.code === 'busy') {
       return t(`fieldErrors.${error.code}`)
+    }
+    if (error.code === 'upstream_pending') {
+      return t('fieldErrors.upstream_pending', { servers: serverNames(error.details.servers) })
     }
   }
   return t('fieldErrors.generic')
@@ -822,6 +832,7 @@ const APPLY_ERRORS = [
   'ssh_host_key_changed',
   'cancelled',
   'interrupted',
+  'timeout',
 ] as const
 
 function ApplyFailed({
@@ -839,24 +850,17 @@ function ApplyFailed({
   const code = (APPLY_ERRORS as readonly string[]).includes(failure.code)
     ? failure.code
     : 'internal'
-  // Unless the job says otherwise, assume the worst is not the case only when
-  // it explicitly reported restoring.
-  const restored = details.restored !== false
+  // Only what the job itself reported: see aftermath.
+  const left = aftermath(details)
   const output = typeof details.output === 'string' ? details.output : ''
 
   return (
     <Panel className="border border-destructive/40 bg-destructive/5">
       <div className="flex flex-col gap-1">
         <h2 className="font-heading text-base font-semibold text-destructive">
-          {restored
-            ? t('config.applyFailed.titleRestored')
-            : t('config.applyFailed.titleNotRestored')}
+          {t(`config.applyFailed.title.${left}`)}
         </h2>
-        <p>
-          {restored
-            ? t('config.applyFailed.restored', { name: server.name })
-            : t('config.applyFailed.notRestored', { name: server.name })}
-        </p>
+        <p>{t(`config.applyFailed.${left}`, { name: server.name })}</p>
       </div>
       <div className="flex flex-col gap-1">
         <p className="font-semibold">{t(`server.errors.${code}.title`, details)}</p>
@@ -932,7 +936,7 @@ function RotateDialog({
 function ConfigTab({ server }: { server: Server }) {
   const { t } = useTranslation()
   const query = useServerConfig(server)
-  const [copied, setCopied] = useState(false)
+  const { copied, copy } = useCopy()
 
   if (!query.data) {
     return (
@@ -956,12 +960,7 @@ function ConfigTab({ server }: { server: Server }) {
         variant="outline"
         size="sm"
         className="self-start"
-        onClick={() => {
-          void navigator.clipboard.writeText(text).then(() => {
-            setCopied(true)
-            setTimeout(() => setCopied(false), 2000)
-          })
-        }}
+        onClick={() => copy(text)}
       >
         {copied ? t('common.copied') : t('config.copyConfig')}
       </Button>

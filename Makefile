@@ -28,7 +28,7 @@ node:
 # does that), set XC_TEST_CHECK_URL to an address it resolves honestly.
 integration: node
 	XC_TEST_NODE=$$(./test/node/address.sh xc-node) \
-		go test -tags integration -count=1 -timeout 600s ./internal/sshx/ ./internal/install/
+		go test -tags integration -count=1 -timeout 600s ./internal/sshx/ ./internal/xray/ ./internal/install/
 
 # The chain test needs three nodes: an entry and two exits.
 integration-chain:

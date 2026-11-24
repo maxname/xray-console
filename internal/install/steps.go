@@ -95,7 +95,7 @@ func (s *session) stepSSH(ctx context.Context, run *ops.Run) error {
 
 // installKey signs in with the password once, adds the panel's key to
 // authorized_keys and comes back signed in with the key.
-func (s *session) installKey(ctx context.Context, run *ops.Run, srv *servers.Server, key *sshkeys.Key) (*sshx.Client, error) {
+func (s *session) installKey(ctx context.Context, run *ops.Run, srv *servers.Server, key *sshkeys.Key) (sshx.Remote, error) {
 	tgt := target(srv)
 	byPassword, err := s.inst.dial(ctx, tgt, sshx.Auth{Password: s.password}, srv.HostKey)
 	if err != nil {
@@ -103,12 +103,7 @@ func (s *session) installKey(ctx context.Context, run *ops.Run, srv *servers.Ser
 	}
 	defer byPassword.Close()
 
-	// grep first: running this twice must not add the line twice.
-	script := fmt.Sprintf(`umask 077
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
-grep -qF %s ~/.ssh/authorized_keys || printf '%%s\n' %s >> ~/.ssh/authorized_keys`,
-		sshx.Quote(key.AuthorizedKey()), sshx.Quote(key.PublicKey))
+	script := sshx.InstallAuthorizedKey(key.AuthorizedKey(), key.PublicKey)
 	run.Cmd("ssh-copy-id -i " + key.Name + ".pub " + tgt.String())
 	if out, err := byPassword.Run(ctx, script); err != nil {
 		logOutput(run, out)
@@ -178,10 +173,10 @@ sshd -T 2>/dev/null | grep -i '^passwordauthentication' || true`
 // reload. A reloading sshd closes its listening socket for an instant and
 // refuses connections; that is not the server being unreachable, so it is
 // waited out rather than reported.
-func (s *session) dialAfterReload(ctx context.Context, srv *servers.Server, key *sshkeys.Key) (*sshx.Client, error) {
+func (s *session) dialAfterReload(ctx context.Context, srv *servers.Server, key *sshkeys.Key) (sshx.Remote, error) {
 	var err error
 	for attempt := 0; attempt < 10; attempt++ {
-		var client *sshx.Client
+		var client sshx.Remote
 		client, err = s.inst.dial(ctx, target(srv), sshx.Auth{Signer: key.Signer()}, srv.HostKey)
 		if err == nil {
 			return client, nil
@@ -229,10 +224,7 @@ func (s *session) undoSSH(ctx context.Context, run *ops.Run) error {
 	}
 	if hasChange(srv, changeSSHKey) {
 		// Last: after this the panel cannot get back in.
-		script := fmt.Sprintf(`f=~/.ssh/authorized_keys
-[ -f "$f" ] || exit 0
-grep -vF %s "$f" > "$f.xc-tmp" || true
-cat "$f.xc-tmp" > "$f" && rm -f "$f.xc-tmp"`, sshx.Quote(key.AuthorizedKey()))
+		script := sshx.RemoveAuthorizedKey(key.AuthorizedKey())
 		if run != nil {
 			run.Cmd("remove " + key.Name + " from ~/.ssh/authorized_keys")
 		}
@@ -271,6 +263,11 @@ func parseFacts(out string) map[string]string {
 	facts := map[string]string{}
 	for _, line := range strings.Split(out, "\n") {
 		if key, value, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
+			// What a server says about itself is stored and shown: a name,
+			// not a document.
+			if len(value) > 120 {
+				value = strings.ToValidUTF8(value[:120], "")
+			}
 			facts[key] = value
 		}
 	}
@@ -390,13 +387,23 @@ func (s *session) stepXray(ctx context.Context, run *ops.Run) error {
 		return err
 	}
 
-	prepare := `id -u ` + xray.SystemUser + ` >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ` + xray.SystemUser + `
+	// A user that was there before the panel is not the panel's to delete, so
+	// it goes into the manifest only when this step made it — and before it is
+	// made, so that a lost connection cannot leave it unrecorded.
+	existed, err := s.sudo(ctx, run, "id -u "+xray.SystemUser+" >/dev/null 2>&1 && echo yes || echo no")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(existed) != "yes" {
+		if err := s.addChange(ctx, changeUser, xray.SystemUser); err != nil {
+			return err
+		}
+	}
+	prepare := `set -e
+id -u ` + xray.SystemUser + ` >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ` + xray.SystemUser + `
 install -d -m 0755 ` + xray.AssetDir + `
 install -d -m 0750 -o root -g ` + xray.SystemUser + ` ` + xray.ConfigDir
 	if _, err := s.sudo(ctx, run, prepare); err != nil {
-		return err
-	}
-	if err := s.addChange(ctx, changeUser, xray.SystemUser); err != nil {
 		return err
 	}
 
@@ -415,7 +422,7 @@ install -d -m 0750 -o root -g ` + xray.SystemUser + ` ` + xray.ConfigDir
 		}
 	}
 
-	if _, err := s.sudo(ctx, run, xray.BinaryPath+" version | head -n 1"); err != nil {
+	if _, err := s.sudo(ctx, run, versionCheck(xray.BinaryPath)); err != nil {
 		return err
 	}
 	if err := s.inst.Servers.SetXrayVersion(ctx, s.serverID, bundle.Version); err != nil {
@@ -442,7 +449,7 @@ func (s *session) fetchRelease(ctx context.Context, run *ops.Run, version, arch 
 
 // uploadRelease puts a release's files where destOf says and checks each one
 // arrived whole.
-func (s *session) uploadRelease(ctx context.Context, run *ops.Run, client *sshx.Client, bundle *xray.Bundle, destOf func(name string) string) error {
+func (s *session) uploadRelease(ctx context.Context, run *ops.Run, client sshx.Remote, bundle *xray.Bundle, destOf func(name string) string) error {
 	for _, file := range bundle.Files {
 		dest, mode := destOf(file.Name), uint32(0o644)
 		if file.Name == "xray" {
@@ -468,9 +475,16 @@ func (s *session) uploadRelease(ctx context.Context, run *ops.Run, client *sshx.
 }
 
 func (s *session) undoXray(ctx context.Context, run *ops.Run) error {
+	srv, err := s.server(ctx)
+	if err != nil {
+		return err
+	}
 	script := `rm -f ` + xray.BinaryPath + `
-rm -rf ` + xray.AssetDir + ` ` + xray.ConfigDir + `
-userdel ` + xray.SystemUser + ` 2>/dev/null || true`
+rm -rf ` + xray.AssetDir + ` ` + xray.ConfigDir
+	// Only a user the installation made: one that was there before it stays.
+	if hasChange(srv, changeUser) {
+		script += "\nuserdel " + xray.SystemUser + " 2>/dev/null || true"
+	}
 	if _, err := s.sudo(ctx, run, script); err != nil {
 		return err
 	}

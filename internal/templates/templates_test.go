@@ -148,3 +148,32 @@ func TestNamesAreUniqueAndChecked(t *testing.T) {
 		t.Fatal("a fixed field was made overridable")
 	}
 }
+
+func TestTheLastTemplateStays(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if err := s.EnsureDefault(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.DefaultID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A server is installed from a template: there is always one to install from.
+	if err := s.Delete(ctx, first); !errors.Is(err, ErrLast) {
+		t.Fatalf("deleting the only template: %v", err)
+	}
+	second, err := s.Create(ctx, "edge", "", Defaults(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, first); err != nil {
+		t.Fatalf("deleting one of two: %v", err)
+	}
+	if err := s.Delete(ctx, second.ID); !errors.Is(err, ErrLast) {
+		t.Fatalf("deleting the one that is left: %v", err)
+	}
+	if err := s.Delete(ctx, 999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleting a template that is not there: %v", err)
+	}
+}

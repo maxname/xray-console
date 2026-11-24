@@ -15,12 +15,12 @@ import {
   type OverviewServer,
   type PanelEvent,
 } from '@/lib/api'
+import { type Translate } from '@/lib/errors'
+import { aftermath } from '@/lib/failures'
 import { formatBytes, formatDayTime, formatDuration, formatPercent } from '@/lib/format'
 import { useMe } from '@/lib/use-me'
 import { useNow } from '@/lib/use-now'
 import { cn } from '@/lib/utils'
-
-type Translate = (key: string, options?: Record<string, unknown>) => string
 
 export function OverviewPage() {
   const { t } = useTranslation()
@@ -364,9 +364,7 @@ function describeEvent(t: Translate, event: PanelEvent): string {
         : t('overview.events.config_applied_same', { name })
     }
     case 'apply_failed':
-      return data.restored === false
-        ? t('overview.events.apply_failed_broken', { name })
-        : t('overview.events.apply_failed', { name })
+      return t(`overview.events.apply_failed.${aftermath(data)}`, { name })
     case 'server_up':
       return t('overview.events.server_up', {
         name,
@@ -384,9 +382,7 @@ function describeEvent(t: Translate, event: PanelEvent): string {
       if (event.kind === 'xray_updated') {
         return t('overview.events.xray_updated', versions)
       }
-      return data.restored === false
-        ? t('overview.events.update_failed_broken', versions)
-        : t('overview.events.update_failed', versions)
+      return t(`overview.events.update_failed.${aftermath(data)}`, versions)
     }
     default:
       return t(`overview.events.${event.kind}`, { name })

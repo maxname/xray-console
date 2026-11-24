@@ -28,6 +28,8 @@ type fixture struct {
 	entry   *servers.Server
 	set     *rulesets.RuleSet
 	busy    bool
+	// failing makes an apply start and change nothing, as one that fails does.
+	failing bool
 	applied []int64
 }
 
@@ -77,7 +79,9 @@ func newFixture(t *testing.T) *fixture {
 		Busy: func(int64) bool { return f.busy },
 		Apply: func(_ context.Context, id int64) error {
 			f.applied = append(f.applied, id)
-			f.apply()
+			if !f.failing {
+				f.apply()
+			}
 			return nil
 		},
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -179,5 +183,49 @@ func TestOnlyTimePassingIsActedOnAndOnlyWhenNothingElseWouldChange(t *testing.T)
 	f.apply()
 	if n := f.sweep(now); n != 0 {
 		t.Fatalf("applied again after the administrator did (%d)", n)
+	}
+}
+
+func TestAnApplyThatDoesNotTakeIsNotRepeatedEveryMinute(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	now := time.Now()
+	guest, _ := f.subs.Create(ctx, "Гость", f.set.ID, time.Time{})
+	f.apply()
+	if err := f.subs.Update(ctx, guest.ID, guest.Name, f.set.ID, true, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every apply restarts Xray on the entry: one that fails must not come
+	// back a minute later, and the minute after that.
+	f.failing = true
+	for _, step := range []struct {
+		after time.Duration
+		want  int
+	}{
+		{0, 1},
+		{time.Minute, 0},
+		{14 * time.Minute, 0},
+		{15 * time.Minute, 1},
+		{16 * time.Minute, 0},
+		{74 * time.Minute, 0},
+		{75 * time.Minute, 1},
+		{76 * time.Minute, 0},
+	} {
+		if n := f.sweep(now.Add(step.after)); n != step.want {
+			t.Fatalf("%s after the end date: applied %d servers, want %d", step.after, n, step.want)
+		}
+	}
+
+	// It works at last, and the server owes nothing: the count starts again.
+	f.failing = false
+	if n := f.sweep(now.Add(8 * time.Hour)); n != 1 {
+		t.Fatalf("applied %d servers once the wait was over, want 1", n)
+	}
+	if n := f.sweep(now.Add(8*time.Hour + time.Minute)); n != 0 {
+		t.Fatalf("applied the server again (%d) with nothing to cut off", n)
+	}
+	if len(f.sweeper.tried) != 0 {
+		t.Fatalf("still remembering %d servers after they were dealt with", len(f.sweeper.tried))
 	}
 }

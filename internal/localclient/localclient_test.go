@@ -257,3 +257,35 @@ func TestTheClientListensWhileOnAndSaysWhyWhenItCannot(t *testing.T) {
 		t.Fatalf("after the port was freed: %+v", got)
 	}
 }
+
+func TestAPortTakenDoesNotLeaveTheOtherOneHeld(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.apply()
+	socks, httpPort := freePorts(t)
+
+	// The second port, not the first: Xray would bind the first, fail on the
+	// second and keep the first — and never start again in this process.
+	taken, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(httpPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	if err := f.client.Save(ctx, true, f.set.ID, socks, httpPort); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.client.Status(); got.State != StateFailed || got.Error != ErrorPortInUse {
+		t.Fatalf("with the HTTP port taken: %+v", got)
+	}
+	if listening(socks) {
+		t.Fatal("the SOCKS port was left held by a client that did not start")
+	}
+	taken.Close()
+	f.client.Sync(ctx)
+	if got := f.client.Status(); got.State != StateRunning {
+		t.Fatalf("after the port was freed: %+v", got)
+	}
+	if !listening(socks) || !listening(httpPort) {
+		t.Fatal("the proxies do not listen after the port was freed")
+	}
+}

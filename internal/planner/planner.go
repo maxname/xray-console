@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"xray-console/internal/chains"
@@ -57,6 +58,80 @@ func (p *Planner) For(ctx context.Context, srv *servers.Server) (*plan.Plan, err
 		return nil, err
 	}
 	return plan.Build(srv, tpl, routing)
+}
+
+// Awaiting names the servers srv hands chain traffic to whose own settings —
+// how they accept connections — are edited but not applied yet. srv's desired
+// configuration already dials them the new way; applied before they are, it
+// would send a chain's traffic to a door that is not there yet.
+func (p *Planner) Awaiting(ctx context.Context, srv *servers.Server) ([]string, error) {
+	used, err := p.Chains.UsedBy(ctx, srv.ID)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	seen := map[int64]bool{srv.ID: true}
+	for _, chain := range used {
+		for index, hop := range chain.Hops {
+			if !inHop(hop, srv.ID) || index+1 >= len(chain.Hops) {
+				continue
+			}
+			next := chain.Hops[index+1]
+			for _, id := range append(append([]int64{}, next.Servers...), next.Reserve) {
+				if id == 0 || seen[id] {
+					continue
+				}
+				seen[id] = true
+				target, err := p.Servers.Get(ctx, id)
+				if errors.Is(err, servers.ErrNotFound) {
+					continue
+				}
+				if err != nil {
+					return nil, err
+				}
+				if target.Status != servers.StatusReady || target.Applied == nil || target.Inbound == nil {
+					continue
+				}
+				desired, err := p.For(ctx, target)
+				if err != nil {
+					return nil, err
+				}
+				for _, field := range desired.Changed(target.Applied) {
+					// What it does with the traffic is its own business; only
+					// how it takes it in matters to the link before.
+					if field != plan.FieldChains && field != plan.FieldPolicies && field != plan.FieldRevision {
+						names = append(names, target.Name)
+						break
+					}
+				}
+			}
+		}
+	}
+	return names, nil
+}
+
+// FarFirst orders servers so that one a chain hands traffic to comes before
+// the one that hands it over: applied in this order, a link is ready to
+// accept before the link before it starts sending the new way. Servers no
+// chain connects keep their order.
+func (p *Planner) FarFirst(ctx context.Context, list []*servers.Server) ([]*servers.Server, error) {
+	all, err := p.Chains.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	depth := map[int64]int{}
+	for _, chain := range all {
+		for index, hop := range chain.Hops {
+			for _, id := range append(append([]int64{}, hop.Servers...), hop.Reserve) {
+				if id != 0 && index > depth[id] {
+					depth[id] = index
+				}
+			}
+		}
+	}
+	out := append([]*servers.Server{}, list...)
+	sort.SliceStable(out, func(a, b int) bool { return depth[out[a].ID] > depth[out[b].ID] })
+	return out, nil
 }
 
 // routing works out what the server does for each chain it is part of.

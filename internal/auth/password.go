@@ -22,6 +22,12 @@ const (
 	argonSaltLen = 16
 )
 
+// argonSlots is how many hashes may be computed at once. Each takes tens of
+// megabytes for as long as it runs, and some are asked for by people who have
+// not signed in; without a limit, enough of them at once is all the memory
+// the panel has.
+var argonSlots = make(chan struct{}, 2)
+
 // HashPassword returns a self-describing argon2id hash (PHC string format), so
 // the cost can be raised later without invalidating existing hashes.
 func HashPassword(password string) (string, error) {
@@ -29,6 +35,8 @@ func HashPassword(password string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
+	argonSlots <- struct{}{}
+	defer func() { <-argonSlots }()
 	key := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version, argonMemory, argonTime, argonThreads,
@@ -60,6 +68,8 @@ func VerifyPassword(encoded, password string) (bool, error) {
 	if err != nil {
 		return false, errors.New("malformed password hash")
 	}
+	argonSlots <- struct{}{}
+	defer func() { <-argonSlots }()
 	got := argon2.IDKey([]byte(password), salt, time, memory, threads, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }

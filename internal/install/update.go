@@ -111,7 +111,11 @@ func (i *Installer) Update(ctx context.Context, serverID int64) (*ops.Operation,
 		data := map[string]any{"from": params.From, "to": params.To}
 		if done.Error != nil {
 			data["code"] = done.Error.Code
-			data["restored"] = done.Error.Details["restored"] != false
+			// Only what the job reported: one that never said is not assumed
+			// to have put things back.
+			if restored, said := done.Error.Details["restored"].(bool); said {
+				data["restored"] = restored
+			}
 		}
 		i.Events.Add(events.UpdateFailed, srv.ID, srv.Name, data)
 	}
@@ -150,7 +154,7 @@ func (s *session) updateFetch(ctx context.Context, run *ops.Run) error {
 	if err != nil {
 		return fail(err)
 	}
-	if _, err := s.sudo(ctx, run, nextDir+"/xray version | head -n 1"); err != nil {
+	if _, err := s.sudo(ctx, run, versionCheck(nextDir+"/xray")); err != nil {
 		return fail(err)
 	}
 
@@ -175,13 +179,16 @@ func (s *session) updateFetch(ctx context.Context, run *ops.Run) error {
 func (s *session) updateReplace(ctx context.Context, run *ops.Run) error {
 	// mv, not cp, onto the binary: a running program's file cannot be written
 	// to, but it can be replaced.
-	replace := `rm -rf ` + PrevDir + `
+	// set -e: a release that was not set aside cannot be put back, and a
+	// binary that did not move must not be recorded as the new one.
+	replace := `set -e
+rm -rf ` + PrevDir + `
 install -d -m 0755 ` + PrevDir + `
 cp -p ` + xray.BinaryPath + ` ` + PrevDir + `/xray
 cp -p ` + xray.AssetDir + `/geoip.dat ` + xray.AssetDir + `/geosite.dat ` + PrevDir + `/
 mv -f ` + nextDir + `/geoip.dat ` + nextDir + `/geosite.dat ` + xray.AssetDir + `/
 mv -f ` + nextDir + `/xray ` + xray.BinaryPath + `
-rmdir ` + nextDir + `
+rm -rf ` + nextDir + `
 systemctl restart ` + xray.ServiceName
 	// From the first line on the server may be between two releases.
 	s.replaced = true
@@ -241,11 +248,13 @@ func (s *session) restoreRelease(ctx context.Context, run *ops.Run) bool {
 	defer cancel()
 	// Only what was actually set aside is put back, so a replace that failed
 	// on its first line restores nothing it did not move.
-	restore := `if [ -f ` + PrevDir + `/xray ]; then
-cp -p ` + PrevDir + `/xray ` + xray.BinaryPath + `.restore && mv -f ` + xray.BinaryPath + `.restore ` + xray.BinaryPath + `
+	restore := `set -e
+if [ -f ` + PrevDir + `/xray ]; then
+cp -p ` + PrevDir + `/xray ` + xray.BinaryPath + `.restore
+mv -f ` + xray.BinaryPath + `.restore ` + xray.BinaryPath + `
 fi
 for f in geoip.dat geosite.dat; do
-[ -f ` + PrevDir + `/$f ] && cp -p ` + PrevDir + `/$f ` + xray.AssetDir + `/$f
+if [ -f ` + PrevDir + `/$f ]; then cp -p ` + PrevDir + `/$f ` + xray.AssetDir + `/$f; fi
 done
 rm -rf ` + nextDir + `
 systemctl restart ` + xray.ServiceName + `

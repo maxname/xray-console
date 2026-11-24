@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"xray-console/internal/probe"
 	"xray-console/internal/secrets"
@@ -319,7 +321,12 @@ func TestAChannelThatFailsIsRetriedAndTheOtherIsNotSentTwice(t *testing.T) {
 	f.mu.Lock()
 	f.telegramDown = false
 	f.mu.Unlock()
+	// Not at once: a message that failed twice waits a couple of minutes.
 	f.after(30 * time.Second)
+	if got := f.texts(); len(got) != 0 {
+		t.Fatalf("retried before its turn: %v", got)
+	}
+	f.after(3 * time.Minute)
 	if got := f.texts(); len(got) != 1 || !strings.Contains(got[0], "ams-1") {
 		t.Fatalf("Telegram once it works again: %v", got)
 	}
@@ -329,17 +336,60 @@ func TestAChannelThatFailsIsRetriedAndTheOtherIsNotSentTwice(t *testing.T) {
 	}
 }
 
-func TestAMessageNobodyTakesIsGivenUpOn(t *testing.T) {
+// quietly switches off what would add messages or hold them back, for tests
+// that are about the retries alone.
+func (f *fixture) retriesOnly() {
+	settings := f.settings()
+	settings.QuietHours, settings.RepeatHours = false, 0
+	f.save(settings)
+}
+
+func TestAChannelDownForAWhileStillGetsTheMessage(t *testing.T) {
 	f := newFixture(t)
+	f.retriesOnly()
 	ams := f.server("ams-1")
 	f.telegramDown, f.webhookDown = true, true
 	f.down(ams)
 	f.after(5 * time.Minute)
-	for range maxAttempts {
+	// Twenty minutes of a channel that refuses, with the panel ticking as it
+	// does: "server down" must still be there when the channel is back.
+	for range 40 {
 		f.after(30 * time.Second)
 	}
+	f.mu.Lock()
+	f.telegramDown, f.webhookDown = false, false
+	f.mu.Unlock()
+	for range 40 {
+		f.after(30 * time.Second)
+	}
+	if got := f.texts(); len(got) != 1 || !strings.Contains(got[0], "ams-1") {
+		t.Fatalf("Telegram after the channel came back: %v", got)
+	}
+	if hooks := f.hooks(); len(hooks) != 1 {
+		t.Fatalf("webhook after the channel came back: %v", hooks)
+	}
+}
+
+func TestAMessageNobodyTakesIsGivenUpOn(t *testing.T) {
+	f := newFixture(t)
+	f.retriesOnly()
+	ams := f.server("ams-1")
+	f.telegramDown, f.webhookDown = true, true
+	f.down(ams)
+	f.after(5 * time.Minute)
+	var waited time.Duration
+	for attempt := 1; attempt < maxAttempts; attempt++ {
+		if pending, _ := f.store.Pending(context.Background()); len(pending) != 1 {
+			t.Fatalf("after %d attempts and %s: %d messages queued, want 1", attempt, waited, len(pending))
+		}
+		f.after(retryDelay(attempt))
+		waited += retryDelay(attempt)
+	}
 	if pending, _ := f.store.Pending(context.Background()); len(pending) != 0 {
-		t.Fatalf("still queued after %d rounds: %+v", maxAttempts, pending)
+		t.Fatalf("still queued after %d attempts: %+v", maxAttempts, pending)
+	}
+	if waited < 12*time.Hour {
+		t.Fatalf("given up on after only %s", waited)
 	}
 	f.mu.Lock()
 	f.telegramDown, f.webhookDown = false, false
@@ -347,6 +397,38 @@ func TestAMessageNobodyTakesIsGivenUpOn(t *testing.T) {
 	f.after(30 * time.Second)
 	if got := f.texts(); len(got) != 0 {
 		t.Fatalf("stale news delivered after all: %v", got)
+	}
+}
+
+func TestALongListIsSentInPartsTelegramWillTake(t *testing.T) {
+	var messages []Message
+	for i := range 120 {
+		messages = append(messages, Message{
+			ID: int64(i), At: time.Unix(1_700_000_000, 0),
+			Text: strings.Repeat("ж", 90),
+		})
+	}
+	parts := batches(messages, telegramLimit)
+	if len(parts) < 2 {
+		t.Fatalf("%d messages went into %d part(s)", len(messages), len(parts))
+	}
+	next := int64(0)
+	for _, part := range parts {
+		if n := utf8.RuneCountInString(digest(part)); n > 4096 {
+			t.Fatalf("a part is %d characters; Telegram takes 4096", n)
+		}
+		for _, m := range part {
+			if m.ID != next {
+				t.Fatalf("message %d is out of order or missing (got %d)", next, m.ID)
+			}
+			next++
+		}
+	}
+	if int(next) != len(messages) {
+		t.Fatalf("%d of %d messages made it into the parts", next, len(messages))
+	}
+	if got := batches(nil, telegramLimit); len(got) != 0 {
+		t.Fatalf("nothing to send became %d part(s)", len(got))
 	}
 }
 
@@ -507,5 +589,39 @@ func TestDurationsReadLikeSpeech(t *testing.T) {
 		if got := duration(d); got != want {
 			t.Errorf("%v: %q, want %q", d, got, want)
 		}
+	}
+}
+
+func TestAWebhookIsNotFollowedElsewhereAndItsAnswerIsNotQuoted(t *testing.T) {
+	f := newFixture(t)
+	var reached atomic.Int32
+	inside := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Add(1)
+		http.Error(w, "the secret page of something on the panel's own network", http.StatusForbidden)
+	}))
+	defer inside.Close()
+	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, inside.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirecting.Close()
+
+	message := Message{At: f.now, Kind: KindTest, Text: "test", Data: map[string]any{}}
+	settings := f.settings()
+
+	// Sent to an address that points elsewhere: not followed there.
+	settings.WebhookURL = redirecting.URL
+	err := f.notifier.sendWebhook(context.Background(), settings, message)
+	if err == nil || reached.Load() != 0 {
+		t.Fatalf("a redirect was followed (%d requests reached the other address): %v", reached.Load(), err)
+	}
+
+	// Sent straight to something that refuses: the status, not the page.
+	settings.WebhookURL = inside.URL
+	err = f.notifier.sendWebhook(context.Background(), settings, message)
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("a refusal: %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("the answer's own words came back: %v", err)
 	}
 }

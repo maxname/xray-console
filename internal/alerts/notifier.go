@@ -11,15 +11,36 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+	"unicode/utf8"
 
 	"xray-console/internal/probe"
 	"xray-console/internal/servers"
 )
 
-// maxAttempts is how many delivery rounds a message gets before it is given
-// up on: a channel that has been broken for that long is not going to carry
-// stale news usefully.
-const maxAttempts = 5
+// maxAttempts is how many times a message is tried before it is given up on.
+// With the waits of retryDelay between them that is most of a day: a channel
+// that has been broken for that long is not going to carry stale news
+// usefully, but one that was down for an evening still gets "server down".
+const maxAttempts = 10
+
+// retryDelay is how long to wait after the attempts-th failure in a row.
+func retryDelay(attempts int) time.Duration {
+	waits := []time.Duration{
+		time.Minute, 2 * time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute,
+		time.Hour, 2 * time.Hour, 4 * time.Hour, 6 * time.Hour,
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > len(waits) {
+		attempts = len(waits)
+	}
+	return waits[attempts-1]
+}
+
+// telegramLimit is the most Telegram takes in one message (4096 characters),
+// with room to spare: a longer one is refused every time it is sent.
+const telegramLimit = 3500
 
 // DefaultTelegramAPI is where Telegram's bot API lives.
 const DefaultTelegramAPI = "https://api.telegram.org"
@@ -81,7 +102,7 @@ func (n *Notifier) Tick(ctx context.Context) {
 	if settings.QuietHours && quiet(now) {
 		return
 	}
-	n.deliver(ctx, settings)
+	n.deliver(ctx, settings, now)
 }
 
 func (n *Notifier) watchServers(ctx context.Context, settings Settings, now time.Time) error {
@@ -211,11 +232,21 @@ func (n *Notifier) watchRelease(ctx context.Context, now time.Time) {
 	}
 }
 
-// deliver sends everything waiting: to Telegram as one message, to the
-// webhook one event at a time.
-func (n *Notifier) deliver(ctx context.Context, settings Settings) {
-	pending, err := n.Store.Pending(ctx)
-	if err != nil || len(pending) == 0 {
+// deliver sends everything that is due: to Telegram as one message (several
+// when there is too much for one), to the webhook one event at a time. A
+// message that failed before waits for its turn.
+func (n *Notifier) deliver(ctx context.Context, settings Settings, now time.Time) {
+	waiting, err := n.Store.Pending(ctx)
+	if err != nil {
+		return
+	}
+	var pending []Message
+	for _, m := range waiting {
+		if !m.retryAt.After(now) {
+			pending = append(pending, m)
+		}
+	}
+	if len(pending) == 0 {
 		return
 	}
 	failed := map[int64]bool{}
@@ -227,16 +258,16 @@ func (n *Notifier) deliver(ctx context.Context, settings Settings) {
 				unsent = append(unsent, m)
 			}
 		}
-		if len(unsent) > 0 {
-			if err := n.sendTelegram(ctx, settings, digest(unsent)); err != nil {
+		for _, batch := range batches(unsent, telegramLimit) {
+			if err := n.sendTelegram(ctx, settings, digest(batch)); err != nil {
 				n.Log.Warn("could not send to Telegram", "err", err)
-				for _, m := range unsent {
+				for _, m := range batch {
 					failed[m.ID] = true
 				}
-			} else {
-				for _, m := range unsent {
-					_ = n.Store.markSent(ctx, m.ID, "sent_telegram")
-				}
+				continue
+			}
+			for _, m := range batch {
+				_ = n.Store.markSent(ctx, m.ID, "sent_telegram")
 			}
 		}
 	}
@@ -262,9 +293,31 @@ func (n *Notifier) deliver(ctx context.Context, settings Settings) {
 			n.Log.Warn("giving up on an alert that could not be delivered", "kind", m.Kind, "server", m.Server)
 			_ = n.Store.drop(ctx, m.ID)
 		default:
-			_ = n.Store.failed(ctx, m.ID)
+			_ = n.Store.failed(ctx, m.ID, now.Add(retryDelay(m.attempts+1)))
 		}
 	}
+}
+
+// batches splits messages into runs whose digests each fit in limit
+// characters, keeping their order.
+func batches(messages []Message, limit int) [][]Message {
+	var out [][]Message
+	var current []Message
+	size := 0
+	for _, m := range messages {
+		// What digest adds around a message: the time, a dash, a line break.
+		length := utf8.RuneCountInString(m.Text) + 16
+		if len(current) > 0 && size+length > limit {
+			out = append(out, current)
+			current, size = nil, 0
+		}
+		current = append(current, m)
+		size += length
+	}
+	if len(current) > 0 {
+		out = append(out, current)
+	}
+	return out
 }
 
 // TestResult is how a test message fared on each channel: "" for a channel
@@ -325,7 +378,13 @@ func (n *Notifier) Run(ctx context.Context) {
 // post sends JSON and returns the response body of anything but a 2xx as part
 // of the error. Errors never carry the URL: Telegram's has the bot token in
 // it, and a webhook's may be a secret too.
-func (n *Notifier) post(ctx context.Context, address string, body any) error {
+//
+// tell says whether the answer's own words go into the error. Telegram's do:
+// "chat not found" is what the administrator needs to read. A webhook's do
+// not: its address is whatever was typed in, and an error that quotes the
+// answer would make the "test" button a way to read pages off the panel's
+// own network.
+func (n *Notifier) post(ctx context.Context, address string, body any, tell bool) error {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -338,10 +397,13 @@ func (n *Notifier) post(ctx context.Context, address string, body any) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "xray-console")
-	client := n.Client
-	if client == nil {
-		client = http.DefaultClient
+	client := http.Client{Timeout: 20 * time.Second}
+	if n.Client != nil {
+		client = *n.Client
 	}
+	// The message goes to the address it was given and nowhere that address
+	// sends it on to.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
 		var urlErr *url.Error
@@ -354,6 +416,9 @@ func (n *Notifier) post(ctx context.Context, address string, body any) error {
 	if resp.StatusCode/100 == 2 {
 		return nil
 	}
+	if !tell {
+		return fmt.Errorf("answered %s", resp.Status)
+	}
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 	return fmt.Errorf("answered %s: %s", resp.Status, bytes.TrimSpace(detail))
 }
@@ -365,11 +430,11 @@ func (n *Notifier) sendTelegram(ctx context.Context, settings Settings, text str
 	}
 	return n.post(ctx, api+"/bot"+settings.TelegramToken+"/sendMessage", map[string]any{
 		"chat_id": settings.TelegramChat, "text": text, "disable_web_page_preview": true,
-	})
+	}, true)
 }
 
 func (n *Notifier) sendWebhook(ctx context.Context, settings Settings, m Message) error {
 	return n.post(ctx, settings.WebhookURL, map[string]any{
 		"event": m.Kind, "server": m.Server, "at": m.At.Unix(), "text": m.Text, "data": m.Data,
-	})
+	}, false)
 }

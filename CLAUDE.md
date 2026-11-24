@@ -18,8 +18,14 @@ memory, `xray-console-design-canvas`).
 - No subscription limits (traffic, speed, device count).
 - Node side: nginx as the stub site, acme.sh for certificates, ufw or nftables
   depending on what is found.
-- UI language is Russian, through i18next so English can be added as one more
-  catalogue (`web/src/i18n/`).
+- UI language is Russian, and only Russian: an English catalogue is not
+  planned. Strings still go through i18next (`web/src/i18n/`).
+- The panel serves plain HTTP and is meant to sit behind a reverse proxy that
+  terminates TLS. It will not do TLS itself; what belongs to the panel is
+  behaving correctly behind the proxy (`--trusted-proxies`, the cookie's
+  `Secure` flag) and saying so when it is set up wrongly.
+- `.claude/launch.json` and the local path below stay in the public
+  repository.
 - Not related to Angie Panel. Only its look is reused; shadcn components may be
   copied from `/Users/maxname/dev/archive/reverse-proxy/frontend`.
 
@@ -36,7 +42,13 @@ left is in the "Not built yet" notes below.
 
 - The panel downloads the Xray release itself, checks it against the published
   SHA-256 and uploads the files over SSH. A server needs neither curl, unzip
-  nor a route to GitHub.
+  nor a route to GitHub. The checksum is kept next to the cached archive and
+  the archive is checked against it again every time it is used; a copy that
+  no longer matches is downloaded again.
+- A client of a server cannot reach the server's own loopback or private
+  addresses through it. The panel writes no rule for that: Xray's `freedom`
+  outbound refuses them to proxied clients by itself. `make integration`
+  checks that the release on the node still does.
 - An installation is an operation of eight steps (`internal/install`), each
   resumable and undoable. A failure pauses it; the administrator retries from
   that step or rolls everything back. Everything changed on the server is
@@ -96,7 +108,13 @@ left is in the "Not built yet" notes below.
   left and no reserve falls back to `block`, never to the entry's own exit.
 - Chain membership is part of a server's plan (the `chains` field), so adding
   a server to a chain shows on that server as a change to apply. "Apply on the
-  servers" does them far end first.
+  servers" does them far end first, and so does "apply to all"
+  (`Planner.FarFirst`).
+- A link's desired configuration dials the next link the way that one should
+  accept connections, not the way it does yet. So a server whose chains would
+  change is refused an apply (`upstream_pending`, naming the servers) while a
+  server it hands traffic to has its own settings edited and not applied
+  (`Planner.Awaiting`): the far end goes first.
 - The prober sends a request through every chain each round, entering at the
   entry as the chain's user.
 
@@ -133,7 +151,9 @@ left is in the "Not built yet" notes below.
   `internal/lapse` looks once a minute for servers that still let in a
   subscription past its end date and applies them — only when `policies` is
   the server's sole pending change. Otherwise it logs once and leaves the
-  server to the administrator.
+  server to the administrator. An apply that does not take the subscription
+  off is not repeated a minute later — every one restarts Xray there: the
+  next comes after 15 minutes, then an hour, then every six hours.
 - A chain cannot be deleted, or have its entry moved, while a rule set sends
   traffic into it; a server cannot be deleted while it is a rule set's entry;
   a rule set cannot be deleted while subscriptions are on it.
@@ -209,8 +229,10 @@ yet), a list of commands to finish a removal by hand.
   (once per release). It sends to a Telegram chat through a bot and to a
   webhook as JSON. Messages wait in `alert_outbox`: quiet hours (23:00–08:00,
   the panel's clock) hold them and Telegram then gets one list; a channel
-  that fails is retried without the other getting the message twice, and
-  after five rounds a message is dropped. Settings are sealed (they hold the
+  that fails is retried without the other getting the message twice, after
+  waits that grow from a minute to six hours (`retry_at`), and a message is
+  dropped after ten attempts — most of a day. A list too long for one
+  Telegram message is sent in parts. Settings are sealed (they hold the
   bot token) and the token is never sent back to the browser.
 - The sentences alerts send are Russian, in `internal/alerts/messages.go` —
   the one place where text for people is written in Go.
@@ -248,7 +270,9 @@ per-chain traffic, the checks' settings screen.
   rotation — the device shows as waiting, and one that has "send changes
   automatically" gets them at the panel's next look at it (once a minute,
   which is also how "online" is known). A configuration the client does not
-  start with is replaced by the previous one.
+  start with is replaced by the previous one, and the same configuration is
+  then not sent again at once: after 5 minutes, then 30, then every 3 hours.
+  A job on a device has 20 minutes.
 - Deleting a device takes the client off it and the panel's key too if the
   panel put it there; a device that cannot be reached is deleted from the
   panel only, and the answer says so.
@@ -297,7 +321,10 @@ importing other SSH keys.
 - `internal/servers` — the servers the panel manages and their manifests.
 - `internal/sshx` — SSH client: pinned host keys, commands, file uploads.
 - `internal/sshkeys` — the panel's own SSH key.
+- `internal/remote` — how a failed connection or command is told to the
+  administrator; shared by jobs on servers and on devices.
 - `internal/ops` — runs step-by-step jobs with a log, retry and rollback.
+  Finished jobs older than 90 days are pruned, except each server's latest.
 - `internal/install` — the installation steps, applying settings, the
   connection check, updating Xray, removing it.
 - `internal/templates` — templates, their fields and versions.
@@ -328,7 +355,9 @@ importing other SSH keys.
 ## Commands
 
 - `make build` — frontend, then the single binary at `bin/xray-console`.
-- `make test` — `go vet`, Go tests, ESLint, Vitest.
+- `make test` — `go vet`, Go tests, ESLint, Vitest. CI
+  (`.github/workflows/ci.yml`) runs the build, `gofmt` and this on every push
+  and pull request; the Docker integration tests are run by hand.
 - `make run` — build and start on 127.0.0.1:8080 with `./data`.
 - `make node` — start a throwaway Debian node in Docker (`test/node`); it
   prints the address and the root password to add it in the UI.
@@ -344,13 +373,67 @@ importing other SSH keys.
 - API errors are `{"error": {"code", "message", "details"}}`. The UI translates
   by `code`; `message` is English, for logs.
 - State-changing requests must carry the `X-XC-Request` header (CSRF).
+- What can be asked without signing in — setup, sign-in, `/s/<token>` — goes
+  through `Server.limited` (a burst, then a trickle, per address; IPv6 by
+  /64). Failed sign-ins are counted the same way (`auth.throttleKey`), one
+  attempt at a time. A session not asked to be remembered ends a week after
+  it began however much it is used (`auth.SessionMax`).
+- A panel listening on loopback believes a reverse proxy on its own machine
+  without `--trusted-proxies` (`config.Loopback`); anything else has to be
+  named. The setup link carries its code after `#`, which no server logs.
+- What a managed server or device says is not trusted to be small or true:
+  command output, log lines, counters and facts are all bounded where they
+  come in (`sshx.maxOutput`, `ops.maxLogLine`, `traffic.maxCounters`).
+- Outgoing requests go where they were told and nowhere a redirect points:
+  webhooks follow none and their answers are not quoted back; a release is
+  followed only to GitHub's own hosts (`xray.releaseHost`).
 - Every user-visible string goes through `t()`; Russian plurals use the
   `_one/_few/_many/_other` suffixes.
 - Do not show a control for something that does not work yet.
+- A page explains a refused request with `explainKnown` (`lib/errors.ts`),
+  naming the codes its own `<namespace>.errors` has; special cases come
+  before it. `i18n/catalogue.test.ts` fails on a key the code asks for and
+  the catalogue lacks.
+- One of several options is a `Segmented` (a radio group with arrow keys),
+  not hand-made buttons with `role="tab"`.
+- Deleting anything takes two clicks: a typed name for a server, the
+  `ConfirmStrip` inside the dialog for everything else. A dialog's form with
+  state of its own is a component inside `DialogContent`, so closing the
+  dialog forgets what was typed.
+- Copying goes through `useCopy` / `copyText` (`lib/clipboard.ts`): the
+  clipboard API does not exist on a page opened over plain HTTP.
+- What a failed apply or update left behind is shown as the job reported it
+  (`aftermath` in `lib/failures.ts`): restored, not restored, or unknown.
+  Never assume "restored".
 - Operation failures carry a `code`; the UI has a title and a paragraph per
   code in `server.errors`. A new code needs both, or it reads as "internal".
 - Step details and log lines are technical facts in English; everything else
   the administrator reads is translated.
+- The installer's jobs talk to a server through `sshx.Remote`, so they can
+  be tested against `fakeServer` (`internal/install/unit_test.go`): a server
+  that is not there and fails as told. A change to apply, update or their
+  restore paths comes with a test there; the Docker tests cover the path
+  where everything works.
+- A taken name is recognised with `store.IsUnique`, by the database's result
+  code, never by the words of its message.
 - Anything written to a shell command is either validated to a strict shape
   (`servers.ValidateTarget`, `xray.NormalizeMaskHost`) or quoted with
   `sshx.Quote`.
+- A root script of several commands that changes the server starts with
+  `set -e`: a shell script's status is its last command's, so without it a
+  failed copy is followed by a restart that looks fine. Never judge a command
+  by a pipeline (`xray version | head`) for the same reason.
+- A step has a time limit (`ops.DefaultStepTimeout`, or its own `Timeout`)
+  and fails with `timeout` past it; an SSH connection whose server stops
+  answering is closed by the keepalive (`sshx`). Either way a job ends and
+  lets go of its server instead of holding it until someone cancels.
+- A job cut short by the panel restarting is marked failed (`interrupted`),
+  and for an apply or an update the overview's feed says the server's state
+  is unknown. Nothing is put back automatically: the server is to be looked
+  at and applied again.
+- Background rounds — checks, traffic, the look at devices — do their hosts
+  several at a time and recover a panic per host: one that does not answer,
+  or one stored row that does not hold what it should, is not everyone's
+  problem.
+- An operation's `finish` runs before its server is released (`ops`): until
+  then nothing else may start there.

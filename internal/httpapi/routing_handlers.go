@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"xray-console/internal/chains"
+	"xray-console/internal/localclient"
 	"xray-console/internal/plan"
 	"xray-console/internal/rulesets"
 	"xray-console/internal/servers"
@@ -198,12 +199,33 @@ func (s *Server) handleDeleteRuleSet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	set, err := s.ruleSets.Get(r.Context(), id)
+	ctx := r.Context()
+	set, err := s.ruleSets.Get(ctx, id)
 	if s.routingError(w, r, err) {
 		return
 	}
-	if s.routingError(w, r, s.ruleSets.Delete(r.Context(), id)) {
+	// The panel's own client is a user of a rule set like a subscription or a
+	// device, but its settings are not a table the store could count. While
+	// it is on, its set stays; switched off, it simply forgets the set.
+	var local localclient.Settings
+	if s.localClient != nil {
+		if local, err = s.localClient.Settings(ctx); err != nil {
+			s.internalError(w, r, err)
+			return
+		}
+		if local.Enabled && local.RuleSetID == id {
+			writeError(w, http.StatusConflict, "rule_set_local_client",
+				"the rule set is used by the panel's own client", nil)
+			return
+		}
+	}
+	if s.routingError(w, r, s.ruleSets.Delete(ctx, id)) {
 		return
+	}
+	if s.localClient != nil && local.RuleSetID == id {
+		if err := s.localClient.Save(ctx, false, 0, local.SocksPort, local.HTTPPort); err != nil {
+			s.log.Warn("the panel's own client still names a deleted rule set", "err", err)
+		}
 	}
 	s.log.Info("rule set deleted", "rule_set", set.Name)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -494,8 +516,12 @@ func (s *Server) handleSubscriptionFeed(w http.ResponseWriter, r *http.Request) 
 			lines = append(lines, link)
 		}
 	}
-	if err := s.subs.MarkFetched(r.Context(), sub.ID, now); err != nil {
-		s.log.Warn("could not note a subscription fetch", "err", err)
+	// To the minute is enough for "last fetched", and it keeps an app that
+	// asks in a loop from being a write to the database every time.
+	if now.Sub(sub.FetchedAt) >= time.Minute {
+		if err := s.subs.MarkFetched(r.Context(), sub.ID, now); err != nil {
+			s.log.Warn("could not note a subscription fetch", "err", err)
+		}
 	}
 
 	header := w.Header()

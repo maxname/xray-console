@@ -37,6 +37,13 @@ type Totals struct {
 // Sum is both directions together.
 func (t Totals) Sum() int64 { return t.Up + t.Down }
 
+// Bounds on what one server's answer may contribute. The longest name the
+// panel gives a user is "chain-" or "sub-" and a number.
+const (
+	maxCounterName = 64
+	maxCounters    = 5000
+)
+
 // ParseStats reads the output of `xray api statsquery`: a JSON object with a
 // list of {name, value}, names being "inbound>>>TAG>>>traffic>>>uplink" or
 // "user>>>EMAIL>>>traffic>>>downlink". Only the given inbound and users are
@@ -65,6 +72,16 @@ func ParseStats(raw, inboundTag string) ([]Counter, error) {
 			continue
 		}
 		scope, name, direction := parts[0], parts[1], parts[3]
+		// This is a server's word about itself, and a server may have been
+		// taken over. Names the panel never gives a user, and more counters
+		// than a server could honestly have, are not written down: every
+		// counter becomes rows kept for ninety days.
+		if len(name) > maxCounterName {
+			continue
+		}
+		if _, known := byKey[[2]string{scope, name}]; !known && len(byKey) >= maxCounters {
+			continue
+		}
 		switch {
 		case scope == ScopeInbound && name == inboundTag:
 		case scope == ScopeUser && name != "":

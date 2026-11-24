@@ -12,6 +12,7 @@ import {
   UptimeLegend,
 } from '@/components/charts'
 import { EmptyState, Page, PageHeader, Panel } from '@/components/page'
+import { Segmented } from '@/components/segmented'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -50,6 +51,7 @@ import {
   type StatsPeriod,
   type StatsServer,
 } from '@/lib/api'
+import { type Translate } from '@/lib/errors'
 import {
   formatBytes,
   formatDay,
@@ -78,29 +80,12 @@ export function StatsPage() {
 
   const actions = (
     <>
-      <div
-        role="tablist"
-        aria-label={t('stats.period.label')}
-        className="flex gap-1 rounded-lg bg-muted p-1"
-      >
-        {PERIODS.map((option) => (
-          <button
-            key={option}
-            type="button"
-            role="tab"
-            aria-selected={period === option}
-            className={cn(
-              'rounded-md px-3 py-1 text-sm font-medium outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
-              period === option
-                ? 'bg-card shadow-sm'
-                : 'text-muted-foreground hover:text-foreground',
-            )}
-            onClick={() => setPeriod(option)}
-          >
-            {t(`stats.period.${option}`)}
-          </button>
-        ))}
-      </div>
+      <Segmented
+        label={t('stats.period.label')}
+        options={PERIODS.map((option) => ({ value: option, label: t(`stats.period.${option}`) }))}
+        value={period}
+        onChange={setPeriod}
+      />
       <Button variant="outline" onClick={() => setAlerts(true)}>
         {t('alerts.open')}
       </Button>
@@ -420,8 +405,6 @@ function AvailabilityPanel({ stats }: { stats: Stats }) {
 }
 
 // --- alerts ----------------------------------------------------------------------
-
-type Translate = (key: string, options?: Record<string, unknown>) => string
 
 function explainAlert(t: Translate, error: unknown): string {
   if (error instanceof ApiError) {

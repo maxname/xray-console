@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"xray-console/internal/store"
 )
@@ -238,5 +239,114 @@ func TestPanicInAStepFailsTheJobOnly(t *testing.T) {
 	op = f.settle(op.ID)
 	if op.Status != StatusFailed || op.Error.Code != CodeInternal || !strings.Contains(op.Error.Message, "nil map") {
 		t.Fatalf("status %s, error %+v", op.Status, op.Error)
+	}
+}
+
+func TestTheServerStaysTakenUntilFinishHasRun(t *testing.T) {
+	f := newFixture(t)
+	op := f.create()
+	next := f.create()
+	var busyInFinish bool
+	var startedInFinish error
+	finish := func(*Operation) {
+		// finish is where the server's own state is settled; until it has
+		// run, the job is not over for anyone else.
+		busyInFinish = f.manager.Busy(f.server)
+		startedInFinish = f.manager.Execute(next.ID, f.steps(nil), nil)
+	}
+	if err := f.manager.Execute(op.ID, f.steps(nil), finish); err != nil {
+		t.Fatal(err)
+	}
+	f.manager.WaitFor(context.Background(), op.ID)
+	// WaitFor returning means finish has run, not only the steps.
+	if !busyInFinish {
+		t.Fatal("the server was free while finish was still to run")
+	}
+	if !errors.Is(startedInFinish, ErrBusy) {
+		t.Fatalf("another job started on the server during finish: %v", startedInFinish)
+	}
+	f.settle(op.ID)
+	if f.manager.Busy(f.server) {
+		t.Fatal("the server is still taken after the job")
+	}
+}
+
+func TestAStepThatTakesTooLongFailsAsATimeout(t *testing.T) {
+	f := newFixture(t)
+	op := f.create()
+	steps := f.steps(nil)
+	steps[1].Timeout = 20 * time.Millisecond
+	steps[1].Run = func(ctx context.Context, _ *Run) error {
+		<-ctx.Done()
+		// What the step says on its way out is kept: here, that it put
+		// things back.
+		return Fail(CodeInternal, ctx.Err().Error(), map[string]any{"restored": true})
+	}
+	if err := f.manager.Execute(op.ID, steps, nil); err != nil {
+		t.Fatal(err)
+	}
+	op = f.settle(op.ID)
+	if op.Status != StatusFailed || op.Error == nil || op.Error.Code != CodeTimeout || op.Error.Step != "b" {
+		t.Fatalf("status %s, error %+v", op.Status, op.Error)
+	}
+	if op.Error.Details["restored"] != true {
+		t.Fatalf("the step's own report was lost: %v", op.Error.Details)
+	}
+	if statuses(op) != "done,failed,pending" {
+		t.Fatalf("steps %s", statuses(op))
+	}
+	// The server is free again: that is the point of the limit.
+	if f.manager.Busy(f.server) {
+		t.Fatal("the server is still taken by a job that timed out")
+	}
+}
+
+func TestOldJobsArePrunedButNotTheLatestOfAServer(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	var ids []int64
+	for range 3 {
+		op := f.create()
+		if err := f.manager.Execute(op.ID, f.steps(nil), nil); err != nil {
+			t.Fatal(err)
+		}
+		f.settle(op.ID)
+		ids = append(ids, op.ID)
+	}
+	// Everything finished "before" a moment in the future.
+	if err := f.manager.Prune(ctx, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids[:2] {
+		if _, err := f.manager.Get(ctx, id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("old job %d is still there: %v", id, err)
+		}
+	}
+	// The server's page shows its latest job, however old.
+	if _, err := f.manager.Get(ctx, ids[2]); err != nil {
+		t.Fatalf("the server's latest job was pruned: %v", err)
+	}
+	// Nothing finished before the distant past.
+	if err := f.manager.Prune(ctx, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJobsCutShortByARestartAreReturned(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	op := f.create()
+	if _, err := f.manager.db.ExecContext(ctx, `UPDATE operations SET status = ? WHERE id = ?`, StatusRunning, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := f.manager.RecoverInterrupted(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut) != 1 || cut[0].ID != op.ID || cut[0].Status != StatusFailed || cut[0].Error.Code != CodeInterrupted {
+		t.Fatalf("recovered %+v", cut)
+	}
+	if again, _ := f.manager.RecoverInterrupted(ctx); len(again) != 0 {
+		t.Fatalf("recovered the same job twice: %+v", again)
 	}
 }

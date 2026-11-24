@@ -31,7 +31,11 @@ function isKnownError(code: string): code is KnownError {
 
 /** The one-time code arrives in the link the panel prints at start-up. */
 function tokenFromUrl(): string {
-  return new URLSearchParams(window.location.search).get('token') ?? ''
+  // After the "#": that part of an address is never sent to a server, so the
+  // code does not end up in the reverse proxy's log. Before it, for a link
+  // printed by an older panel.
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
+  return fragment ?? new URLSearchParams(window.location.search).get('token') ?? ''
 }
 
 export function SetupPage() {

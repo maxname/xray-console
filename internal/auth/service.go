@@ -11,9 +11,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"xray-console/internal/secrets"
@@ -31,6 +33,10 @@ const (
 	SessionIdle = 12 * time.Hour
 	// SessionRemember is the fixed lifetime of a "remember me" session.
 	SessionRemember = 30 * 24 * time.Hour
+	// SessionMax is how long a session that was not asked to be remembered
+	// can be kept alive by being used. Without it one stolen cookie, used
+	// often enough, is a way into every server for good.
+	SessionMax = 7 * 24 * time.Hour
 
 	MinPasswordLength = 12
 	maxPasswordLength = 512
@@ -75,6 +81,12 @@ type Service struct {
 	db  *sql.DB
 	box *secrets.Box
 	now func() time.Time
+
+	// loginMu makes one sign-in attempt at a time out of "is this address
+	// locked out, is the password right, write the failure down". Run side by
+	// side, a burst of attempts would all pass the first question before any
+	// of them reached the last, and the limit would limit nothing.
+	loginMu sync.Mutex
 }
 
 func NewService(db *sql.DB, box *secrets.Box) *Service {
@@ -180,6 +192,12 @@ func (s *Service) CreateAdmin(ctx context.Context, in SetupInput) (*TOTPEnrollme
 		return nil, err
 	}
 
+	// Hashing is deliberately expensive, and this is asked without signing
+	// in: find out that the request cannot succeed before paying for it.
+	if err := s.setupAllowed(ctx, s.db, in.Token); err != nil {
+		return nil, err
+	}
+
 	// Hash before taking the write lock: argon2 is deliberately slow.
 	hash, err := HashPassword(in.Password)
 	if err != nil {
@@ -208,21 +226,10 @@ func (s *Service) CreateAdmin(ctx context.Context, in SetupInput) (*TOTPEnrollme
 	}
 	defer tx.Rollback()
 
-	var existing int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM admin`).Scan(&existing); err != nil {
+	// Again, now under the write lock: two requests may both have passed the
+	// first look.
+	if err := s.setupAllowed(ctx, tx, in.Token); err != nil {
 		return nil, err
-	}
-	if existing > 0 {
-		return nil, ErrAlreadySetUp
-	}
-
-	var token string
-	err = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = 'setup_token'`).Scan(&token)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(in.Token)) != 1 {
-		return nil, ErrBadSetupToken
 	}
 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO admin
@@ -310,14 +317,42 @@ type Session struct {
 	Remember  bool
 }
 
+// setupAllowed reports whether an administrator may still be created with
+// this token: ErrAlreadySetUp or ErrBadSetupToken when not.
+func (s *Service) setupAllowed(ctx context.Context, q interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}, given string) error {
+	var existing int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM admin`).Scan(&existing); err != nil {
+		return err
+	}
+	if existing > 0 {
+		return ErrAlreadySetUp
+	}
+	var token string
+	err := q.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = 'setup_token'`).Scan(&token)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(given)) != 1 {
+		return ErrBadSetupToken
+	}
+	return nil
+}
+
 // Login checks one attempt and opens a session if it is good.
 //
 // It returns *LockedError, *InvalidCredentialsError, ErrTOTPRequired or
 // ErrSetupRequired for the outcomes a caller should tell apart.
 func (s *Service) Login(ctx context.Context, in LoginInput) (*Session, error) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
 	now := s.now()
 
-	if until, err := s.lockedUntil(ctx, in.IP, now); err != nil {
+	// Failures are counted against where the attempts come from, which for
+	// IPv6 is a network, not one of its endless addresses.
+	from := throttleKey(in.IP)
+	if until, err := s.lockedUntil(ctx, from, now); err != nil {
 		return nil, err
 	} else if until.After(now) {
 		return nil, &LockedError{RetryAfter: until.Sub(now)}
@@ -336,7 +371,7 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*Session, error) {
 		return nil, err
 	}
 	if !userOK || !passOK {
-		return nil, s.recordFailure(ctx, in.IP, now, a)
+		return nil, s.recordFailure(ctx, from, now, a)
 	}
 
 	if a.TOTPEnabled {
@@ -354,15 +389,21 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*Session, error) {
 		// step <= last: the code is valid but has been used already. Someone
 		// reading it over a shoulder gets nothing from typing it again.
 		if !ok || step <= a.TOTPLastStep {
-			return nil, s.recordFailure(ctx, in.IP, now, a)
+			return nil, s.recordFailure(ctx, from, now, a)
 		}
-		if _, err := s.db.ExecContext(ctx,
-			`UPDATE admin SET totp_last_step = ? WHERE id = 1`, step); err != nil {
+		// The step is taken in the same statement that checks it is unused,
+		// so a code cannot be spent twice whatever else is running.
+		taken, err := s.db.ExecContext(ctx,
+			`UPDATE admin SET totp_last_step = ? WHERE id = 1 AND totp_last_step < ?`, step, step)
+		if err != nil {
 			return nil, err
+		}
+		if n, _ := taken.RowsAffected(); n == 0 {
+			return nil, s.recordFailure(ctx, from, now, a)
 		}
 	}
 
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM login_failures WHERE ip = ?`, in.IP); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM login_failures WHERE ip = ?`, from); err != nil {
 		return nil, err
 	}
 	if _, err := s.db.ExecContext(ctx,
@@ -370,6 +411,25 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*Session, error) {
 		return nil, err
 	}
 	return s.CreateSession(ctx, in.IP, in.UserAgent, in.Remember)
+}
+
+// throttleKey is what failed sign-ins from an address are counted under: the
+// address itself, or for IPv6 its /64 — one customer's whole allocation, out
+// of which every attempt could otherwise come from an address not seen before.
+func throttleKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(64)
+	if err != nil {
+		return addr.String()
+	}
+	return prefix.String()
 }
 
 func (s *Service) lockedUntil(ctx context.Context, ip string, now time.Time) (time.Time, error) {
@@ -439,11 +499,11 @@ func (s *Service) Authenticate(ctx context.Context, token string) (bool, error) 
 	hash := hashToken(token)
 	now := s.now()
 
-	var expiresAt, lastSeen int64
+	var createdAt, expiresAt, lastSeen int64
 	var remember bool
 	err := s.db.QueryRowContext(ctx,
-		`SELECT expires_at, last_seen_at, remember FROM sessions WHERE token_hash = ?`, hash,
-	).Scan(&expiresAt, &lastSeen, &remember)
+		`SELECT created_at, expires_at, last_seen_at, remember FROM sessions WHERE token_hash = ?`, hash,
+	).Scan(&createdAt, &expiresAt, &lastSeen, &remember)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -460,6 +520,9 @@ func (s *Service) Authenticate(ctx context.Context, token string) (bool, error) 
 		newExpiry := expiresAt
 		if !remember {
 			newExpiry = now.Add(SessionIdle).Unix()
+			if latest := createdAt + int64(SessionMax/time.Second); newExpiry > latest {
+				newExpiry = latest
+			}
 		}
 		if _, err := s.db.ExecContext(ctx,
 			`UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?`,

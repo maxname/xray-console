@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -52,6 +53,25 @@ func (i *Installer) Apply(ctx context.Context, serverID int64) (*ops.Operation, 
 	if i.Ops.Busy(serverID) {
 		return nil, ops.ErrBusy
 	}
+	// A link of a chain goes after the link it hands traffic to. Asked only
+	// when the chains are part of what would change here: otherwise this
+	// apply does not touch how the next link is dialled.
+	desired, err := i.Planner.For(ctx, srv)
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range desired.Changed(srv.Applied) {
+		if field != plan.FieldChains {
+			continue
+		}
+		first, err := i.Planner.Awaiting(ctx, srv)
+		if err != nil {
+			return nil, err
+		}
+		if len(first) > 0 {
+			return nil, &AwaitingError{Servers: first}
+		}
+	}
 	op, err := i.Ops.Create(ctx, serverID, KindApply, applyOrder, map[string]any{})
 	if err != nil {
 		return nil, err
@@ -71,7 +91,11 @@ func (i *Installer) Apply(ctx context.Context, serverID int64) (*ops.Operation, 
 		data := map[string]any{}
 		if done.Error != nil {
 			data["code"] = done.Error.Code
-			data["restored"] = done.Error.Details["restored"] != false
+			// Only what the job reported: one that never said is not assumed
+			// to have put things back.
+			if restored, said := done.Error.Details["restored"].(bool); said {
+				data["restored"] = restored
+			}
 		}
 		i.Events.Add(events.ApplyFailed, srv.ID, srv.Name, data)
 	}
@@ -102,7 +126,10 @@ func (s *session) applyStage(ctx context.Context, run *ops.Run) error {
 
 func (s *session) applySwap(ctx context.Context, run *ops.Run) error {
 	s.backup = fmt.Sprintf("%s/config-%d.json", BackupDir, s.inst.now().Unix())
-	swap := `mkdir -p -m 0700 ` + BackupDir + `
+	// set -e: without the copy there is nothing to go back to, and a file
+	// that did not move must not be followed by a restart that looks fine.
+	swap := `set -e
+mkdir -p -m 0700 ` + BackupDir + `
 cp -p ` + xray.ConfigPath + ` ` + s.backup + `
 mv -f ` + candidatePath + ` ` + xray.ConfigPath + `
 systemctl restart ` + xray.ServiceName
@@ -148,7 +175,8 @@ func (s *session) restore(ctx context.Context, run *ops.Run) bool {
 	// that must not be left behind.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
 	defer cancel()
-	restore := `cp -p ` + s.backup + ` ` + xray.ConfigPath + `
+	restore := `set -e
+cp -p ` + s.backup + ` ` + xray.ConfigPath + `
 rm -f ` + candidatePath + `
 systemctl restart ` + xray.ServiceName
 	if _, err := s.sudo(ctx, run, restore); err != nil {
@@ -171,6 +199,34 @@ func withRestored(err error, restored bool) error {
 		details[key] = value
 	}
 	return ops.Fail(failure.Code, failure.Message, details)
+}
+
+// Interrupted writes down, for the overview's feed, the applies and updates
+// that a restart of the panel cut short. Nobody was there to put the server
+// back or to say how it was left, so the event says neither: such a server is
+// to be looked at and applied again, not assumed to be as it was.
+func (i *Installer) Interrupted(ctx context.Context, cut []*ops.Operation) {
+	for _, op := range cut {
+		kind := events.ApplyFailed
+		data := map[string]any{"code": ops.CodeInterrupted}
+		switch op.Kind {
+		case KindApply:
+		case KindUpdate:
+			kind = events.UpdateFailed
+			var params struct{ From, To string }
+			_ = json.Unmarshal(op.Params, &params)
+			data["from"], data["to"] = params.From, params.To
+		default:
+			continue
+		}
+		srv, err := i.Servers.Get(ctx, op.ServerID)
+		if err != nil {
+			continue
+		}
+		i.Log.Warn("a job was cut short by the panel restarting; check the server and apply again",
+			"server", srv.Name, "kind", op.Kind)
+		i.Events.Add(kind, srv.ID, srv.Name, data)
+	}
 }
 
 // --- applying a template to every server on it -------------------------------
@@ -247,6 +303,11 @@ func chainBatch(id int64) string    { return "chain-" + strconv.FormatInt(id, 10
 func (i *Installer) ApplyAll(ctx context.Context, templateID int64, onError string) (*Batch, error) {
 	candidates, err := i.Pending(ctx, templateID)
 	if err != nil {
+		return nil, err
+	}
+	// The far end of every chain first, so that no link is told to dial the
+	// next one in a way it does not accept yet.
+	if candidates, err = i.Planner.FarFirst(ctx, candidates); err != nil {
 		return nil, err
 	}
 	return i.startBatch(templateBatch(templateID), candidates, onError, i.Apply)

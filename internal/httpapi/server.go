@@ -128,8 +128,10 @@ func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/health", s.handleHealth)
 	api.HandleFunc("GET /api/auth/state", s.handleAuthState)
-	api.HandleFunc("POST /api/setup", s.handleSetup)
-	api.HandleFunc("POST /api/auth/login", s.handleLogin)
+	// What anyone can ask for, and what it costs to answer: see limiter.
+	signIn := newLimiter(10, 6*time.Second)
+	api.HandleFunc("POST /api/setup", s.limited(signIn, s.handleSetup))
+	api.HandleFunc("POST /api/auth/login", s.limited(signIn, s.handleLogin))
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	api.Handle("POST /api/auth/totp/confirm", s.requireAuth(s.handleTOTPConfirm))
 	api.Handle("GET /api/me", s.requireAuth(s.handleMe))
@@ -209,7 +211,7 @@ func (s *Server) Handler() http.Handler {
 	root.Handle("/api/", s.apiGuards(api))
 	// The subscription link: fetched by apps, so outside the API and its
 	// session.
-	root.HandleFunc("GET /s/{token}", s.handleSubscriptionFeed)
+	root.HandleFunc("GET /s/{token}", s.limited(newLimiter(30, 2*time.Second), s.handleSubscriptionFeed))
 	root.Handle("/", s.spaHandler())
 
 	return s.recoverer(s.securityHeaders(s.accessLog(root)))

@@ -42,13 +42,12 @@ import {
   type LocalClient,
   type RuleSet,
 } from '@/lib/api'
+import { explainKnown, type Translate } from '@/lib/errors'
 import { devicesKey } from '@/lib/rules'
 import { explained } from '@/lib/failures'
 import { formatBytes, formatDayTime, formatDuration } from '@/lib/format'
 import { toast } from '@/lib/toast'
 import { useNow } from '@/lib/use-now'
-
-type Translate = (key: string, options?: Record<string, unknown>) => string
 
 const REFUSALS = [
   'name_taken',
@@ -63,10 +62,7 @@ const REFUSALS = [
 ] as const
 
 function explain(t: Translate, error: unknown): string {
-  if (error instanceof ApiError && (REFUSALS as readonly string[]).includes(error.code)) {
-    return t(`devices.errors.${error.code}`)
-  }
-  return t('common.error')
+  return explainKnown(t, error, 'devices', REFUSALS)
 }
 
 function useDevicesCache() {
@@ -100,6 +96,19 @@ export function LocalClientPanel({ local, sets }: { local: LocalClient; sets: Ru
       }),
     onSuccess: update,
   })
+  // The switch turns the client on and off and nothing else: it goes with the
+  // settings already saved, not with whatever is being typed into the form.
+  // Before the first save there are none, so the rule set shown is the one.
+  const toggle = useMutation({
+    mutationFn: (enabled: boolean) =>
+      api.updateLocalClient({
+        enabled,
+        rule_set_id: local.rule_set_id || ruleSet,
+        socks_port: local.socks_port,
+        http_port: local.http_port,
+      }),
+    onSuccess: update,
+  })
   // Before the first save there is no rule set to differ from.
   const dirty =
     (local.rule_set_id !== 0 && ruleSet !== local.rule_set_id) ||
@@ -118,9 +127,9 @@ export function LocalClientPanel({ local, sets }: { local: LocalClient; sets: Ru
         </div>
         <Switch
           checked={local.enabled}
-          disabled={save.isPending || (sets.length === 0 && !local.enabled)}
+          disabled={save.isPending || toggle.isPending || (sets.length === 0 && !local.enabled)}
           aria-label={t('devices.local.switch')}
-          onCheckedChange={(enabled) => save.mutate(enabled)}
+          onCheckedChange={(enabled) => toggle.mutate(enabled)}
         />
       </div>
 
@@ -195,7 +204,9 @@ export function LocalClientPanel({ local, sets }: { local: LocalClient; sets: Ru
           })}
         </Notice>
       )}
-      {save.isError && <Notice title={explain(t, save.error)} />}
+      {(save.isError || toggle.isError) && (
+        <Notice title={explain(t, save.error ?? toggle.error)} />
+      )}
     </Panel>
   )
 }
@@ -436,6 +447,7 @@ function SettingsFields({
           onCheckedChange={(lan) => onChange({ lan })}
         />
       </label>
+      {value.lan && <Notice tone="warning" title={t('devices.fields.lanWarning')} />}
       <label className="flex items-center justify-between gap-4">
         <span className="flex flex-col">
           <span className="font-medium">{t('devices.fields.autoPush')}</span>

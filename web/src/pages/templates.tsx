@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
+import { ConfirmStrip } from '@/components/confirm-strip'
 import { EmptyState, Page, PageHeader, Panel } from '@/components/page'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -42,17 +43,17 @@ import {
   type TemplateServer,
   type TemplateSummary,
 } from '@/lib/api'
+import { explainKnown, type Translate } from '@/lib/errors'
 import { formatDayTime } from '@/lib/format'
 import { toast } from '@/lib/toast'
 import { cn } from '@/lib/utils'
-
-type Translate = (key: string, options?: Record<string, unknown>) => string
 
 /** Errors with their own sentence, by API code. */
 const KNOWN_ERRORS = [
   'name_taken',
   'invalid_name',
   'template_in_use',
+  'last_template',
   'nothing_to_apply',
   'busy',
   'not_installed',
@@ -66,11 +67,8 @@ function explain(t: Translate, error: unknown): string {
       const text = t(`fieldErrors.${reason}`, { defaultValue: t('fieldErrors.generic') })
       return key ? `${key}: ${text}` : text
     }
-    if ((KNOWN_ERRORS as readonly string[]).includes(error.code)) {
-      return t(`templates.errors.${error.code}`)
-    }
   }
-  return t('common.error')
+  return explainKnown(t, error, 'templates', KNOWN_ERRORS)
 }
 
 export function TemplatesPage() {
@@ -751,6 +749,7 @@ function PropertiesDialog({
     },
   })
   const used = detail.template.server_count
+  const [deleting, setDeleting] = useState(false)
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -796,6 +795,14 @@ function PropertiesDialog({
                 ? t('templates.propertiesDialog.lastOne')
                 : null}
           </p>
+          {deleting && (
+            <ConfirmStrip
+              text={t('templates.propertiesDialog.deleteConfirm', { name: detail.template.name })}
+              pending={remove.isPending}
+              onConfirm={() => remove.mutate()}
+              onCancel={() => setDeleting(false)}
+            />
+          )}
           {(save.isError || remove.isError) && (
             <Notice title={explain(t, save.error ?? remove.error)} />
           )}
@@ -804,7 +811,7 @@ function PropertiesDialog({
               type="button"
               variant="destructive"
               disabled={used > 0 || only || remove.isPending}
-              onClick={() => remove.mutate()}
+              onClick={() => setDeleting(true)}
             >
               {t('templates.propertiesDialog.delete')}
             </Button>

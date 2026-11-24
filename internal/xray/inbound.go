@@ -80,6 +80,17 @@ func (in *Inbound) Clone() *Inbound {
 	return &copied
 }
 
+// shortID is the short id a client of this inbound presents; empty for an
+// inbound that has lost its list. Like MaskHost it answers for a stored row
+// that does not hold what it should, instead of panicking in whoever reads it
+// — the prober does, once a minute, in a goroutine nobody recovers.
+func (in *Inbound) shortID() string {
+	if len(in.ShortIDs) == 0 {
+		return ""
+	}
+	return in.ShortIDs[0]
+}
+
 // MaskHost is the site the server passes itself off as.
 func (in *Inbound) MaskHost() string {
 	if len(in.ServerNames) == 0 {
@@ -322,9 +333,9 @@ func (in *Inbound) ServerConfig(routing *Routing) ([]byte, error) {
 func (in *Inbound) CheckClientConfig(address string, socksPort int) ([]byte, error) {
 	stream := in.streamSettings()
 	stream["realitySettings"] = object{
-		"serverName":  in.ServerNames[0],
+		"serverName":  in.MaskHost(),
 		"publicKey":   in.PublicKey,
-		"shortId":     in.ShortIDs[0],
+		"shortId":     in.shortID(),
 		"fingerprint": "chrome",
 	}
 	config := object{
@@ -395,7 +406,11 @@ Environment=XRAY_LOCATION_ASSET=` + AssetDir + `
 ExecStart=` + BinaryPath + ` run -config ` + ConfigPath + `
 Restart=on-failure
 RestartSec=3
-RestartPreventExitStatus=23
+# 23 and 255 are Xray saying it cannot start with what it was given — a bad
+# configuration, a port something else holds. Restarting changes neither, and
+# a unit that is forever "activating" hides the failure from whoever asks
+# whether it is active.
+RestartPreventExitStatus=23 255
 # Binding to 443 is the one privilege the service needs.
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE

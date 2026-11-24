@@ -261,6 +261,7 @@ func TestIntegrationInstallFailRollbackReinstall(t *testing.T) {
 	t.Logf("manifest: %v", got.Manifest)
 	t.Logf("result: %v", op.Result)
 
+	r.cannotReachItself(srv.ID)
 	r.applyScenario(srv.ID)
 
 	// 4. A second server record for the same machine must be refused: Xray is
@@ -412,6 +413,64 @@ func (r *rig) applyScenario(serverID int64) {
 		t.Fatalf("applied template version %d, want 2", srv.Applied.TemplateVersion)
 	}
 	t.Logf("backups on the node after three applies: see %s", BackupDir)
+}
+
+// cannotReachItself requires that a client of the server cannot use it to get
+// to the server's own loopback: its sshd, Xray's API, whatever else listens
+// only there. The panel writes no rule for this — Xray refuses private
+// addresses to proxied clients by itself — so this is the check that the
+// release on the server still does.
+func (r *rig) cannotReachItself(serverID int64) {
+	r.t.Helper()
+	srv, err := r.servers.Get(context.Background(), serverID)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	inbound, err := plan.RunningInbound(srv.Applied)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	config, err := inbound.ProbeClientConfig(srv.Host, "")
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	client, err := probe.StartClient(config)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	defer client.Close()
+
+	// First that this client gets anywhere at all, or "nothing came back from
+	// the loopback" below would prove nothing.
+	target, err := probe.ParseTarget(envOr("XC_TEST_CHECK_URL", DefaultCheckURL))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	status, err := client.Request(ctx, target)
+	cancel()
+	if err != nil || status < 200 || status >= 400 {
+		r.t.Fatalf("the client does not get out through the server: status %d, %v", status, err)
+	}
+
+	// sshd greets whoever connects, so one byte back means we got through.
+	for _, host := range []string{"127.0.0.1", "localhost"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		conn, err := client.Dial(ctx, host, 22)
+		if err != nil {
+			cancel()
+			continue
+		}
+		stop := context.AfterFunc(ctx, func() { conn.Close() })
+		greeting := make([]byte, 32)
+		n, _ := conn.Read(greeting)
+		stop()
+		conn.Close()
+		cancel()
+		if n > 0 {
+			r.t.Fatalf("a client reached the server's own sshd at %s through the proxy: %q", host, greeting[:n])
+		}
+	}
 }
 
 // probe runs the panel's outside check against the server and requires it to

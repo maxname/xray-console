@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"xray-console/internal/secrets"
+	"xray-console/internal/store"
 	"xray-console/internal/xray"
 )
 
@@ -236,7 +237,7 @@ func (s *Store) Create(ctx context.Context, in NewServer) (*Server, error) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		in.Name, in.Location, in.Host, in.SSHPort, in.SSHUser, in.HostKey, StatusNew, now, now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return nil, ErrNameTaken
 		}
 		return nil, err
@@ -308,6 +309,42 @@ func (s *Store) SetOverrides(ctx context.Context, id int64, overrides map[string
 		return err
 	}
 	return s.touch(ctx, id, `overrides = ?`, string(encoded))
+}
+
+// Settings is a change to what a server should run. A field left nil stays as
+// it is.
+type Settings struct {
+	TemplateID *int64
+	Overrides  map[string]string
+	Inbound    *xray.Inbound
+}
+
+// SetSettings makes the whole change in one statement, so a server is never
+// seen with half of an edit.
+func (s *Store) SetSettings(ctx context.Context, id int64, change Settings) error {
+	var set []string
+	var args []any
+	if change.TemplateID != nil {
+		set, args = append(set, `template_id = ?`), append(args, *change.TemplateID)
+	}
+	if change.Overrides != nil {
+		encoded, err := json.Marshal(change.Overrides)
+		if err != nil {
+			return err
+		}
+		set, args = append(set, `overrides = ?`), append(args, string(encoded))
+	}
+	if change.Inbound != nil {
+		sealed, err := s.seal(change.Inbound)
+		if err != nil {
+			return err
+		}
+		set, args = append(set, `inbound = ?`), append(args, sealed)
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return s.touch(ctx, id, strings.Join(set, ", "), args...)
 }
 
 // SetApplied records what is on the server now; nil forgets it.

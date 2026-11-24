@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"xray-console/internal/secrets"
+	"xray-console/internal/store"
 	"xray-console/internal/xray"
 )
 
@@ -57,7 +58,15 @@ func (c *Chain) UserID(serverID int64) string {
 }
 
 // Entry is the server clients of the chain connect to.
-func (c *Chain) Entry() int64 { return c.Hops[0].Servers[0] }
+//
+// 0 — no server's id — for a chain with no first link: a row that does not
+// hold what a chain is must not bring down whoever reads it.
+func (c *Chain) Entry() int64 {
+	if len(c.Hops) == 0 || len(c.Hops[0].Servers) == 0 {
+		return 0
+	}
+	return c.Hops[0].Servers[0]
+}
 
 // Members lists every server the chain touches, reserves included, from the
 // far end to the entry: the order to configure them in, so that a link is
@@ -252,7 +261,7 @@ func (s *Store) Create(ctx context.Context, name, description string, hops []Hop
 		(name, description, secret, hops, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		name, clip(description), sealed, string(encoded), now, now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return nil, ErrNameTaken
 		}
 		return nil, err
@@ -276,7 +285,7 @@ func (s *Store) Update(ctx context.Context, id int64, name, description string, 
 		updated_at = ?, check_at = NULL, check_ok = NULL, check_ms = NULL, check_error = ''
 		WHERE id = ?`, name, clip(description), string(encoded), time.Now().Unix(), id)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return ErrNameTaken
 		}
 		return err

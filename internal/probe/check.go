@@ -156,6 +156,12 @@ func StartClient(config []byte) (*Client, error) {
 
 func (c *Client) Close() error { return c.instance.Close() }
 
+// Dial opens a connection to host:port through the client's outbound, as a
+// program using the proxy would.
+func (c *Client) Dial(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	return core.Dial(ctx, c.instance, xnet.TCPDestination(xnet.ParseAddress(host), xnet.Port(port)))
+}
+
 // Request sends the check request through the client's outbound and returns
 // the HTTP status it got.
 func (c *Client) Request(ctx context.Context, target *Target) (int, error) {

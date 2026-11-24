@@ -61,6 +61,10 @@ export function EntryApply({
   // the part this page is about.
   const others = entry.changed.filter((key) => key !== 'policies')
   const refused = apply.error instanceof ApiError ? apply.error.code : null
+  const first =
+    apply.error instanceof ApiError && Array.isArray(apply.error.details.servers)
+      ? apply.error.details.servers.filter((name) => typeof name === 'string').join(', ')
+      : ''
 
   return (
     <div className="flex flex-col gap-2 text-sm">
@@ -92,7 +96,9 @@ export function EntryApply({
           title={
             refused === 'busy' || refused === 'not_installed'
               ? t(`entryApply.errors.${refused}`)
-              : t('common.error')
+              : refused === 'upstream_pending'
+                ? t('entryApply.errors.upstream_pending', { servers: first })
+                : t('common.error')
           }
         />
       )}

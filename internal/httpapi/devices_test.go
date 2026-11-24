@@ -189,3 +189,45 @@ func TestDeviceEndpointsNeedASession(t *testing.T) {
 		t.Errorf("delete without a session: %d", got.status)
 	}
 }
+
+func TestARuleSetTheLocalClientUsesStays(t *testing.T) {
+	h := newHarness(t)
+	h.setup()
+	entry := h.readyServer("entry")
+	set := h.do("POST", "/api/rule-sets", map[string]any{"name": "Основной", "entry_server_id": entry.ID, "default_action": "direct"})
+	path := "/api/rule-sets/" + num(id(set))
+
+	var ports []int
+	for range 2 {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ports = append(ports, listener.Addr().(*net.TCPAddr).Port)
+		listener.Close()
+	}
+	body := map[string]any{"enabled": true, "rule_set_id": id(set), "socks_port": ports[0], "http_port": ports[1]}
+	if on := h.do("PUT", "/api/local-client", body); on.status != http.StatusOK {
+		t.Fatalf("switch on: %d %s", on.status, on.raw)
+	}
+
+	// The client is a user of the set, as a subscription would be.
+	if resp := h.do("DELETE", path, nil); resp.status != http.StatusConflict || resp.errorCode() != "rule_set_local_client" {
+		t.Fatalf("deleting the set the client is on: %d %s", resp.status, resp.raw)
+	}
+
+	// Switched off it is nobody's user: the set goes, and the client does not
+	// go on naming a set that is not there.
+	body["enabled"] = false
+	if off := h.do("PUT", "/api/local-client", body); off.status != http.StatusOK {
+		t.Fatalf("switch off: %d %s", off.status, off.raw)
+	}
+	if resp := h.do("DELETE", path, nil); resp.status != http.StatusOK {
+		t.Fatalf("deleting the set of a client that is off: %d %s", resp.status, resp.raw)
+	}
+	after := h.do("GET", "/api/devices", nil)
+	local, _ := after.body["local"].(map[string]any)
+	if local["rule_set_id"] != float64(0) || local["socks_port"] != float64(ports[0]) {
+		t.Fatalf("the client after its set was deleted: %s", after.raw)
+	}
+}

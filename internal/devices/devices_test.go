@@ -291,3 +291,40 @@ func TestAnInterruptedJobCanBeRunAgain(t *testing.T) {
 		}
 	}
 }
+
+func TestSettingsThatDidNotTakeAreNotSentAgainEveryMinute(t *testing.T) {
+	m := &Manager{}
+	start := time.Now()
+	at := func(after time.Duration) time.Time { return start.Add(after) }
+
+	for _, step := range []struct {
+		after  time.Duration
+		digest string
+		want   bool
+	}{
+		{0, "a", true},
+		// Still waiting a minute later — they did not take — and sending
+		// them again would restart the client again.
+		{time.Minute, "a", false},
+		{5 * time.Minute, "a", true},
+		{6 * time.Minute, "a", false},
+		{34 * time.Minute, "a", false},
+		{35 * time.Minute, "a", true},
+		// Different settings are not the ones that failed: at once.
+		{36 * time.Minute, "b", true},
+		{37 * time.Minute, "b", false},
+	} {
+		if got := m.duePush(1, step.digest, at(step.after)); got != step.want {
+			t.Fatalf("%s in, settings %s: due=%v, want %v", step.after, step.digest, got, step.want)
+		}
+	}
+	// Another device has a count of its own.
+	if !m.duePush(2, "a", at(time.Minute)) {
+		t.Fatal("one device's wait held another's settings back")
+	}
+	// Once the settings took there is nothing left to remember.
+	m.forgetPush(1)
+	if !m.duePush(1, "b", at(38*time.Minute)) {
+		t.Fatal("a device whose settings took was still made to wait")
+	}
+}

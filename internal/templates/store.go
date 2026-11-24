@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"xray-console/internal/store"
 )
 
 // DefaultName is the template a fresh panel starts with.
@@ -21,6 +23,9 @@ var (
 	ErrInvalidName = errors.New("name: 1–40 characters: letters, digits, dot, dash, underscore")
 	// ErrInUse: servers still point at the template.
 	ErrInUse = errors.New("template is used by servers")
+	// ErrLast: the only template there is. A server is installed from one, so
+	// there must always be one.
+	ErrLast = errors.New("the last template cannot be deleted")
 	// ErrNoVersion: asked to go back to a version that does not exist.
 	ErrNoVersion = errors.New("no such version")
 )
@@ -103,7 +108,7 @@ func (s *Store) Create(ctx context.Context, name, description string, values map
 	result, err := tx.ExecContext(ctx, `INSERT INTO templates (name, description, created_at) VALUES (?, ?, ?)`,
 		name, clip(description, 200), now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return nil, ErrNameTaken
 		}
 		return nil, err
@@ -246,7 +251,7 @@ func (s *Store) Rename(ctx context.Context, id int64, name, description string) 
 	result, err := s.db.ExecContext(ctx, `UPDATE templates SET name = ?, description = ? WHERE id = ?`,
 		name, clip(description, 200), id)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return ErrNameTaken
 		}
 		return err
@@ -330,14 +335,24 @@ func (s *Store) Delete(ctx context.Context, id int64) error {
 	if used > 0 {
 		return ErrInUse
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM templates WHERE id = ?`, id)
+	// Never the last one, and said in the same statement that deletes: two
+	// deletions at once must not each see the other's template still there.
+	result, err := s.db.ExecContext(ctx, `DELETE FROM templates WHERE id = ?
+		AND (SELECT COUNT(*) FROM templates) > 1`, id)
 	if err != nil {
 		return err
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
+	if n, _ := result.RowsAffected(); n > 0 {
+		return nil
+	}
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM templates WHERE id = ?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return ErrLast
 }
 
 // describeChange lists what differs between a version and new content, in

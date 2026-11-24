@@ -321,3 +321,77 @@ func TestARuleIntoABrokenChainBlocksInsteadOfLeaking(t *testing.T) {
 		t.Fatalf("default route into a chain that no longer starts here: %+v", last)
 	}
 }
+
+// applyNow records the server's desired configuration as applied.
+func (f *fixture) applyNow(srv *servers.Server) {
+	f.t.Helper()
+	ctx := context.Background()
+	fresh, _ := f.servers.Get(ctx, srv.ID)
+	p, err := f.planner.For(ctx, fresh)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.servers.SetApplied(ctx, srv.ID, p.Snapshot(fresh, time.Now())); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) awaiting(srv *servers.Server) []string {
+	f.t.Helper()
+	fresh, _ := f.servers.Get(context.Background(), srv.ID)
+	names, err := f.planner.Awaiting(context.Background(), fresh)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return names
+}
+
+func TestALinkWaitsForTheNextOnesOwnSettings(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	entry, exit, spare := f.server("entry", true), f.server("exit", true), f.server("spare", true)
+	f.chain("Европа", chains.Hop{Servers: []int64{entry.ID}}, chains.Hop{Servers: []int64{exit.ID}, Reserve: spare.ID})
+	for _, srv := range []*servers.Server{entry, exit, spare} {
+		f.applyNow(srv)
+	}
+	if got := f.awaiting(entry); len(got) != 0 {
+		t.Fatalf("with everything applied the entry waits for %v", got)
+	}
+
+	// The exit is to answer on another path, and has not been told yet: the
+	// entry's new configuration already dials that path.
+	if err := f.servers.SetOverrides(ctx, exit.ID, map[string]string{templates.FieldPadding: "200-900"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.awaiting(entry); len(got) != 1 || got[0] != "exit" {
+		t.Fatalf("with the exit edited and not applied the entry waits for %v, want [exit]", got)
+	}
+	// The exit itself hands traffic to nobody.
+	if got := f.awaiting(exit); len(got) != 0 {
+		t.Fatalf("the last link waits for %v", got)
+	}
+	f.applyNow(exit)
+	if got := f.awaiting(entry); len(got) != 0 {
+		t.Fatalf("with the exit applied the entry still waits for %v", got)
+	}
+}
+
+func TestBatchesGoFromTheFarEndOfAChain(t *testing.T) {
+	f := newFixture(t)
+	entry, middle, exit, alone := f.server("entry", true), f.server("middle", true), f.server("exit", true), f.server("alone", true)
+	f.chain("Европа",
+		chains.Hop{Servers: []int64{entry.ID}}, chains.Hop{Servers: []int64{middle.ID}}, chains.Hop{Servers: []int64{exit.ID}})
+
+	ordered, err := f.planner.FarFirst(context.Background(), []*servers.Server{entry, alone, middle, exit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, srv := range ordered {
+		names = append(names, srv.Name)
+	}
+	// Servers no chain connects keep their place among themselves.
+	if got := strings.Join(names, " "); got != "exit middle entry alone" {
+		t.Fatalf("order %q, want the far end first", got)
+	}
+}

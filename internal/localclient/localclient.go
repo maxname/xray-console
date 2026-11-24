@@ -14,8 +14,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"xray-console/internal/plan"
@@ -96,6 +99,11 @@ type Client struct {
 	// Target is the request the client's own check sends.
 	Target *probe.Target
 	Log    *slog.Logger
+
+	// syncMu makes Sync's reconciling one at a time; mu guards the fields
+	// below and is never held across anything slow.
+	syncMu   sync.Mutex
+	checking atomic.Bool
 
 	mu      sync.Mutex
 	running *probe.Client
@@ -210,32 +218,47 @@ func (c *Client) Status() Status {
 // and the entry server say it should, and now and then sends a request
 // through it to see that it still gets out.
 func (c *Client) Sync(ctx context.Context) {
+	c.syncMu.Lock()
+	running, due := c.reconcile(ctx)
+	c.syncMu.Unlock()
+	if running != nil && due {
+		c.check(ctx, running)
+	}
+}
+
+// reconcile makes the client run what it should. It returns the running
+// client, if there is one, and whether a check of it is due. Calls are one at
+// a time (syncMu), and the settings are read inside that turn: read before
+// it, an older reading could be acted on after a newer one and put the
+// client back on the settings just replaced.
+func (c *Client) reconcile(ctx context.Context) (running *probe.Client, due bool) {
 	settings, err := c.Settings(ctx)
 	if err != nil {
 		c.Log.Error("could not load the local client's settings", "err", err)
-		return
+		return nil, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if !settings.Enabled {
-		c.stop()
-		c.status = Status{State: StateOff}
-		return
+		c.set(func() {
+			c.stop()
+			c.status = Status{State: StateOff}
+		})
+		return nil, false
 	}
 	entry, err := c.Entry(ctx, settings)
 	if err != nil {
 		c.Log.Warn("could not look up the local client's entry server", "err", err)
-		return
+		return nil, false
 	}
 	var inbound *xray.Inbound
 	if entry != nil && entry.Status == servers.StatusReady {
 		inbound, _ = plan.RunningInbound(entry.Applied)
 	}
 	if inbound == nil {
-		c.stop()
-		c.status = Status{State: StateFailed, Error: ErrorNoEntry}
-		return
+		c.set(func() {
+			c.stop()
+			c.status = Status{State: StateFailed, Error: ErrorNoEntry}
+		})
+		return nil, false
 	}
 	config, err := (&xray.Client{
 		Address: entry.Host, Inbound: inbound, UUID: settings.UserID(),
@@ -243,28 +266,44 @@ func (c *Client) Sync(ctx context.Context) {
 	}).Config()
 	if err != nil {
 		c.Log.Error("could not render the local client's configuration", "err", err)
-		return
+		return nil, false
 	}
 	sum := sha256.Sum256(config)
 	wanted := hex.EncodeToString(sum[:])
 
-	if c.running == nil || c.digest != wanted {
-		c.stop()
+	c.mu.Lock()
+	current, same := c.running, c.digest == wanted
+	c.mu.Unlock()
+	if current == nil || !same {
+		c.set(c.stop)
+		// Both ports are asked for before anything is started. Xray binds
+		// them one after another and, when the second is taken, gives up
+		// without letting go of the first: that one would then be "in use" —
+		// by this very process — at every later try.
+		if err := portsFree(settings.SocksPort, settings.HTTPPort); err != nil {
+			c.set(func() { c.status = Status{State: StateFailed, Error: ErrorPortInUse, Detail: err.Error()} })
+			c.Log.Warn("the local client did not start", "err", err)
+			return nil, false
+		}
 		started, err := probe.StartClient(config)
 		if err != nil {
 			code := ErrorStart
 			if strings.Contains(err.Error(), "address already in use") {
 				code = ErrorPortInUse
 			}
-			c.status = Status{State: StateFailed, Error: code, Detail: err.Error()}
+			c.set(func() { c.status = Status{State: StateFailed, Error: code, Detail: err.Error()} })
 			c.Log.Warn("the local client did not start", "err", err)
-			return
+			return nil, false
 		}
-		c.running, c.digest = started, wanted
-		c.status = Status{State: StateRunning}
+		c.set(func() {
+			c.running, c.digest = started, wanted
+			c.status = Status{State: StateRunning}
+		})
 		c.Log.Info("the local client is running", "socks", settings.SocksPort, "http", settings.HTTPPort, "entry", entry.Name)
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	// A check that failed is repeated at every look: the usual reason is an
 	// entry server that has not been applied yet, and once it is, the client
 	// should say so without a wait.
@@ -272,18 +311,52 @@ func (c *Client) Sync(ctx context.Context) {
 	if !c.status.CheckedAt.IsZero() && !c.status.CheckOK {
 		every = 0
 	}
-	if c.Target == nil || time.Since(c.status.CheckedAt) < every {
+	return c.running, c.Target != nil && time.Since(c.status.CheckedAt) >= every
+}
+
+// check sends one request through the client and notes how it went. It holds
+// no lock while the request is out — it can take a quarter of a minute, and
+// the status is asked for by every page that shows it.
+func (c *Client) check(ctx context.Context, running *probe.Client) {
+	if !c.checking.CompareAndSwap(false, true) {
 		return
 	}
+	defer c.checking.Store(false)
 	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	status, err := c.running.Request(checkCtx, c.Target)
+	status, err := running.Request(checkCtx, c.Target)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Replaced or stopped meanwhile: this says nothing about what runs now.
+	if c.running != running {
+		return
+	}
 	c.status.CheckedAt = time.Now()
 	c.status.CheckOK = err == nil && status >= 200 && status < 400
 	c.status.CheckError = ""
 	if err != nil {
 		c.status.CheckError = err.Error()
 	}
+}
+
+// set changes the client's state under its lock.
+func (c *Client) set(change func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	change()
+}
+
+// portsFree reports the first of the ports that cannot be listened on.
+func portsFree(ports ...int) error {
+	for _, port := range ports {
+		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			return err
+		}
+		listener.Close()
+	}
+	return nil
 }
 
 // stop closes the running client, if any. The caller holds the lock.

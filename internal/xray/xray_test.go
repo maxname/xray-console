@@ -278,3 +278,30 @@ func TestDeriveUUID(t *testing.T) {
 		t.Fatalf("not a version-4-shaped UUID: %q", a)
 	}
 }
+
+func TestTheUnitDoesNotRestartWhatCannotStart(t *testing.T) {
+	// Exit codes 23 and 255 are Xray refusing to start with what it was given.
+	if unit := ServiceUnit(); !strings.Contains(unit, "\nRestartPreventExitStatus=23 255\n") {
+		t.Fatalf("the unit restarts a service that cannot start:\n%s", unit)
+	}
+}
+
+func TestAnInboundThatLostItsListsIsReadWithoutPanicking(t *testing.T) {
+	in, err := NewInbound("www.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.ServerNames, in.ShortIDs = nil, nil
+	// What comes out is not a working configuration; the point is that
+	// whoever reads such a row — the prober, in a goroutine of its own — is
+	// not taken down by it.
+	if _, err := in.ProbeClientConfig("192.0.2.10", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.CheckClientConfig("192.0.2.10", 30000); err != nil {
+		t.Fatal(err)
+	}
+	if in.MaskHost() != "" {
+		t.Fatalf("mask host %q", in.MaskHost())
+	}
+}

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,5 +258,26 @@ func TestCollectorAsksOnlyServersThatCountAndAreFree(t *testing.T) {
 	by, _ := f.store.ByServer(ctx, now.Add(-time.Hour))
 	if by[counting.ID] != (Totals{0, 500}) || len(by) != 1 {
 		t.Errorf("stored: %+v", by)
+	}
+}
+
+func TestAServerCannotFillTheHistoryWithCountersOfItsOwnMaking(t *testing.T) {
+	var stats []string
+	for i := range maxCounters + 500 {
+		stats = append(stats, fmt.Sprintf(`{"name":"user>>>made-up-%d>>>traffic>>>uplink","value":1}`, i))
+	}
+	stats = append(stats,
+		`{"name":"user>>>`+strings.Repeat("x", maxCounterName+1)+`>>>traffic>>>uplink","value":1}`)
+	counters, err := ParseStats(`{"stat":[`+strings.Join(stats, ",")+`]}`, "in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(counters) != maxCounters {
+		t.Fatalf("kept %d counters, want %d", len(counters), maxCounters)
+	}
+	for _, counter := range counters {
+		if len(counter.Name) > maxCounterName {
+			t.Fatalf("kept a name of %d characters", len(counter.Name))
+		}
 	}
 }

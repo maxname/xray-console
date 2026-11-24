@@ -17,6 +17,7 @@ import (
 	"xray-console/internal/ops"
 	"xray-console/internal/secrets"
 	"xray-console/internal/servers"
+	"xray-console/internal/store"
 	"xray-console/internal/xray"
 )
 
@@ -165,7 +166,11 @@ func (s *Store) scan(row scanner) (*Device, error) {
 }
 
 func (s *Store) List(ctx context.Context) ([]*Device, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM devices ORDER BY id`)
+	return s.list(ctx, `SELECT `+columns+` FROM devices ORDER BY id`)
+}
+
+func (s *Store) list(ctx context.Context, query string, args ...any) ([]*Device, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -187,15 +192,14 @@ func (s *Store) Get(ctx context.Context, id int64) (*Device, error) {
 
 // Users returns the devices on a rule set as users of its entry server.
 func (s *Store) Users(ctx context.Context, ruleSetID int64) ([]xray.PolicyUser, error) {
-	all, err := s.List(ctx)
+	// Asked for every server's plan: only the set's own devices are read.
+	on, err := s.list(ctx, `SELECT `+columns+` FROM devices WHERE rule_set_id = ? ORDER BY id`, ruleSetID)
 	if err != nil {
 		return nil, err
 	}
 	var out []xray.PolicyUser
-	for _, d := range all {
-		if d.RuleSetID == ruleSetID {
-			out = append(out, xray.PolicyUser{Label: d.Label(), UUID: d.UserID()})
-		}
+	for _, d := range on {
+		out = append(out, xray.PolicyUser{Label: d.Label(), UUID: d.UserID()})
 	}
 	return out, nil
 }
@@ -224,7 +228,7 @@ func (s *Store) Create(ctx context.Context, host string, sshPort int, sshUser, h
 		settings.Name, host, sshPort, sshUser, hostKey, settings.RuleSetID, sealed,
 		settings.SocksPort, settings.HTTPPort, settings.LAN, settings.AutoPush, now, now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return nil, ErrNameTaken
 		}
 		return nil, err
@@ -247,7 +251,7 @@ func (s *Store) Update(ctx context.Context, id int64, settings Settings) error {
 		settings.Name, settings.RuleSetID, settings.SocksPort, settings.HTTPPort, settings.LAN,
 		settings.AutoPush, time.Now().Unix(), id)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if store.IsUnique(err) {
 			return ErrNameTaken
 		}
 		return err

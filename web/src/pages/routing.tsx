@@ -5,8 +5,10 @@ import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
+import { ConfirmStrip } from '@/components/confirm-strip'
 import { EntryApply } from '@/components/entry-apply'
 import { EmptyState, Page, PageHeader, Panel } from '@/components/page'
+import { Segmented } from '@/components/segmented'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -49,6 +51,7 @@ import {
   type RuleSetRequest,
   type Server,
 } from '@/lib/api'
+import { explainKnown, type Translate } from '@/lib/errors'
 import {
   chainsFrom,
   clientsPending,
@@ -62,9 +65,13 @@ import {
 } from '@/lib/rules'
 import { cn } from '@/lib/utils'
 
-type Translate = (key: string, options?: Record<string, unknown>) => string
-
-const KNOWN_ERRORS = ['name_taken', 'invalid_name', 'bad_entry', 'rule_set_in_use'] as const
+const KNOWN_ERRORS = [
+  'name_taken',
+  'invalid_name',
+  'bad_entry',
+  'rule_set_in_use',
+  'rule_set_local_client',
+] as const
 
 function explain(t: Translate, error: unknown): string {
   if (error instanceof ApiError) {
@@ -78,11 +85,8 @@ function explain(t: Translate, error: unknown): string {
         defaultValue: t('common.error'),
       })
     }
-    if ((KNOWN_ERRORS as readonly string[]).includes(error.code)) {
-      return t(`routing.errors.${error.code}`)
-    }
   }
-  return t('common.error')
+  return explainKnown(t, error, 'routing', KNOWN_ERRORS)
 }
 
 const ruleSetsKey = ['rule-sets'] as const
@@ -172,29 +176,13 @@ export function RoutingPage() {
       ) : (
         <>
           {sets.length > 1 && (
-            <div
-              role="tablist"
-              aria-label={t('routing.sets')}
-              className="flex flex-wrap gap-1 self-start rounded-lg bg-muted p-1"
-            >
-              {sets.map((set) => (
-                <button
-                  key={set.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={set.id === current.id}
-                  className={cn(
-                    'rounded-md px-3 py-1.5 text-sm font-medium outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
-                    set.id === current.id
-                      ? 'bg-card shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground',
-                  )}
-                  onClick={() => setSelected(set.id)}
-                >
-                  {set.name}
-                </button>
-              ))}
-            </div>
+            <Segmented
+              label={t('routing.sets')}
+              className="self-start"
+              options={sets.map((set) => ({ value: set.id, label: set.name }))}
+              value={current.id}
+              onChange={setSelected}
+            />
           )}
           <RuleSetView
             // A different set is a different list with its own open dialogs.
@@ -265,8 +253,10 @@ function RuleSetView({
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  // null: closed; 'new': adding; a number: editing the rule at that place.
-  const [editing, setEditing] = useState<number | 'new' | null>(null)
+  // null: closed; 'new': adding; otherwise the rule being edited — by its id,
+  // not its place: the list may be reordered or shortened elsewhere while the
+  // editor is open, and a place would then point at another rule.
+  const [editing, setEditing] = useState<{ id: string } | 'new' | null>(null)
   const available = chainsFrom(chains, set.entry.id)
 
   const save = useMutation({
@@ -408,7 +398,7 @@ function RuleSetView({
                     >
                       <ArrowDown />
                     </Button>
-                    <Button variant="outline" size="sm" onClick={() => setEditing(index)}>
+                    <Button variant="outline" size="sm" onClick={() => setEditing({ id: rule.id })}>
                       {t('routing.rules.edit')}
                     </Button>
                   </div>
@@ -468,9 +458,9 @@ function RuleSetView({
 
       {editing !== null && (
         <RuleEditor
-          key={editing}
+          key={editing === 'new' ? 'new' : editing.id}
           set={set}
-          index={editing === 'new' ? null : editing}
+          ruleId={editing === 'new' ? null : editing.id}
           chains={available}
           protocols={protocols}
           onClose={() => setEditing(null)}
@@ -517,22 +507,26 @@ function TargetSelect({
 
 function RuleEditor({
   set,
-  index,
+  ruleId,
   chains,
   protocols,
   onClose,
   onSaved,
 }: {
   set: RuleSet
-  /** The rule's place in the set; null for a new one. */
-  index: number | null
+  /** The rule's id; null for a new one. */
+  ruleId: string | null
   chains: Chain[]
   protocols: string[]
   onClose: () => void
   onSaved: () => void
 }) {
   const { t } = useTranslation()
-  const original = index === null ? null : set.rules[index]
+  const index = ruleId === null ? -1 : set.rules.findIndex((rule) => rule.id === ruleId)
+  const original = index === -1 ? null : set.rules[index]
+  // Deleted while this editor was open — in another tab, say.
+  const gone = ruleId !== null && index === -1
+  const [deleting, setDeleting] = useState(false)
   const [name, setName] = useState(original?.name ?? '')
   const [conditions, setConditions] = useState<RuleCondition[]>(
     original?.conditions ?? [{ type: 'domain', value: '' }],
@@ -554,7 +548,7 @@ function RuleEditor({
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const rule: Rule = {
-      id: original?.id ?? '',
+      id: ruleId ?? '',
       name: name.trim(),
       // A row left blank is a row not filled in, not a condition.
       conditions: conditions.filter((condition) => condition.value.trim() !== ''),
@@ -564,9 +558,9 @@ function RuleEditor({
       enabled,
     }
     save.mutate(
-      index === null
+      ruleId === null
         ? [...set.rules, rule]
-        : set.rules.map((existing, at) => (at === index ? rule : existing)),
+        : set.rules.map((existing) => (existing.id === ruleId ? rule : existing)),
     )
   }
   const setCondition = (at: number, change: Partial<RuleCondition>) =>
@@ -591,9 +585,11 @@ function RuleEditor({
         <form className="grid gap-4 text-sm" onSubmit={handleSubmit}>
           <DialogHeader>
             <DialogTitle>
-              {index === null
+              {ruleId === null
                 ? t('routing.rule.titleNew')
-                : t('routing.rule.titleEdit', { number: index + 1 })}
+                : gone
+                  ? t('routing.rule.titleGone')
+                  : t('routing.rule.titleEdit', { number: index + 1 })}
             </DialogTitle>
             <DialogDescription>{t('routing.rule.description')}</DialogDescription>
           </DialogHeader>
@@ -741,14 +737,23 @@ function RuleEditor({
             />
           </label>
 
+          {gone && <Notice title={t('routing.rule.gone')} />}
+          {deleting && (
+            <ConfirmStrip
+              text={t('routing.rule.deleteConfirm')}
+              pending={save.isPending}
+              onConfirm={() => save.mutate(set.rules.filter((rule) => rule.id !== ruleId))}
+              onCancel={() => setDeleting(false)}
+            />
+          )}
           {save.isError && <Notice title={explain(t, save.error)} />}
           <DialogFooter className="sm:justify-between">
-            {index !== null ? (
+            {ruleId !== null && !gone ? (
               <Button
                 type="button"
                 variant="destructive"
                 disabled={save.isPending}
-                onClick={() => save.mutate(set.rules.filter((_, at) => at !== index))}
+                onClick={() => setDeleting(true)}
               >
                 {t('routing.rule.delete')}
               </Button>
@@ -759,7 +764,7 @@ function RuleEditor({
               <Button type="button" variant="outline" onClick={onClose}>
                 {t('common.cancel')}
               </Button>
-              <Button type="submit" disabled={save.isPending}>
+              <Button type="submit" disabled={save.isPending || gone}>
                 {save.isPending ? t('routing.saving') : t('routing.save')}
               </Button>
             </div>
@@ -818,6 +823,7 @@ function RuleSetEditor({
     mutationFn: () => api.deleteRuleSet(set?.id ?? 0),
     onSuccess: () => onSaved(null),
   })
+  const [deleting, setDeleting] = useState(false)
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -905,6 +911,14 @@ function RuleSetEditor({
             </fieldset>
           )}
 
+          {set && deleting && (
+            <ConfirmStrip
+              text={t('routing.set.deleteConfirm', { name: set.name })}
+              pending={remove.isPending}
+              onConfirm={() => remove.mutate()}
+              onCancel={() => setDeleting(false)}
+            />
+          )}
           {(save.isError || remove.isError) && (
             <Notice title={explain(t, save.error ?? remove.error)} />
           )}
@@ -915,7 +929,7 @@ function RuleSetEditor({
                 variant="destructive"
                 disabled={remove.isPending || set.subscriptions > 0}
                 title={set.subscriptions > 0 ? t('routing.errors.rule_set_in_use') : undefined}
-                onClick={() => remove.mutate()}
+                onClick={() => setDeleting(true)}
               >
                 {t('routing.set.delete')}
               </Button>
