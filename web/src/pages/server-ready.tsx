@@ -282,6 +282,12 @@ function SettingsTab({ server, feed }: { server: Server; feed: OperationFeed | n
                   count: config.changed.length,
                   fields: config.changed.map((key) => fieldLabel(t, key)).join(', '),
                 })}
+            {/* What applying costs the people who are connected right now. */}
+            {config.applied_at !== null && (
+              <span className="block text-xs font-normal text-muted-foreground">
+                {config.restart ? t('config.pending.restart') : t('config.pending.live')}
+              </span>
+            )}
           </span>
           <div className="flex flex-wrap gap-2">
             {config.diff.length > 0 && (
@@ -307,7 +313,9 @@ function SettingsTab({ server, feed }: { server: Server; feed: OperationFeed | n
       {pending && showDiff && config.diff.length > 0 && (
         <Panel title={t('config.diff.title')}>
           <DiffView lines={config.diff} />
-          <p className="text-xs text-muted-foreground">{t('config.pending.note')}</p>
+          <p className="text-xs text-muted-foreground">
+            {config.restart ? t('config.pending.note') : t('config.pending.noteLive')}
+          </p>
         </Panel>
       )}
 

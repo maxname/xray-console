@@ -44,8 +44,10 @@ const (
 	// ConfigRevision changes whenever the panel starts writing something
 	// into every server's configuration that it did not before, so that
 	// servers set up earlier show it as a change to apply. 2: traffic
-	// counters.
-	ConfigRevision = "2"
+	// counters. 3: the API services that add and remove users and replace
+	// routing rules while Xray runs, and a routing section that is always
+	// there for them to work on.
+	ConfigRevision = "3"
 	// CheckEmail labels the one user that exists for the panel itself: it is
 	// what availability checks sign in as.
 	CheckEmail = "panel-check"
@@ -349,7 +351,13 @@ func (in *Inbound) ServerConfig(routing *Routing) ([]byte, error) {
 	// API below. Counting needs all three: the feature, the policy that turns
 	// it on for users of level 0 (every user here), and somewhere to ask.
 	config["stats"] = object{}
-	config["api"] = object{"tag": "api", "listen": APIListen, "services": []string{"StatsService"}}
+	// The other two services are how users and routing rules are changed on
+	// a running Xray, so that a new subscription does not cost everyone on
+	// the server their connections (LiveDiff).
+	config["api"] = object{
+		"tag": "api", "listen": APIListen,
+		"services": []string{serviceStats, serviceHandler, serviceRouting},
+	}
 	config["policy"] = object{
 		"levels": object{"0": object{"statsUserUplink": true, "statsUserDownlink": true}},
 		"system": object{"statsInboundUplink": true, "statsInboundDownlink": true},

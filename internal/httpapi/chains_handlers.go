@@ -28,6 +28,9 @@ type chainServerJSON struct {
 	Changed []string `json:"changed"`
 	// Busy is true while a job — an apply, most likely — runs on the server.
 	Busy bool `json:"busy"`
+	// Restart: applying what is waiting restarts Xray there, which drops its
+	// clients' connections. False when it is only clients and rules.
+	Restart bool `json:"restart"`
 }
 
 type chainHopJSON struct {
@@ -92,6 +95,7 @@ func (s *Server) chainServer(ctx context.Context, id int64, cache map[int64]*cha
 	}
 	view.Changed = p.Changed(srv.Applied)
 	view.Pending = len(view.Changed) > 0
+	view.Restart = view.Pending && p.NeedsRestart(srv.Applied)
 	return view, nil
 }
 

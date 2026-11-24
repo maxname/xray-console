@@ -183,6 +183,17 @@ func (p *Plan) Changed(applied *servers.Applied) []string {
 	return changed
 }
 
+// NeedsRestart reports whether putting this plan on a server that runs the
+// applied one takes a restart of Xray. It does not when the two differ only
+// in who is let in and in the routing rules: those a running Xray is told.
+func (p *Plan) NeedsRestart(applied *servers.Applied) bool {
+	if applied == nil {
+		return true
+	}
+	_, live := xray.LiveDiff([]byte(applied.Config), p.Config)
+	return !live
+}
+
 // Snapshot is what to record once this plan is on the server and checked.
 func (p *Plan) Snapshot(srv *servers.Server, at time.Time) *servers.Applied {
 	overrides := map[string]string{}

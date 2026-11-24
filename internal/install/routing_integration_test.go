@@ -20,6 +20,7 @@ import (
 	"xray-console/internal/rulesets"
 	"xray-console/internal/servers"
 	"xray-console/internal/subs"
+	"xray-console/internal/xray"
 )
 
 // rulesScenario runs on the nodes of the chain test once the chain works:
@@ -35,6 +36,26 @@ func (r *rig) rulesScenario(t *testing.T, entry *servers.Server, chain *chains.C
 	parsed, _ := url.Parse(checkURL)
 	site := parsed.Hostname()
 
+	// Everything this scenario applies is about clients and rules, and none
+	// of it may cost the entry's other clients their connections: Xray there
+	// is told, not restarted. Its process is the same one from start to end.
+	process := func() string {
+		t.Helper()
+		s := &session{inst: r.installer, serverID: entry.ID}
+		defer s.close()
+		out, err := s.quietSudo(ctx, "systemctl show -p MainPID --value "+xray.ServiceName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out)
+	}
+	original := process()
+	untouched := func(what string) {
+		t.Helper()
+		if now := process(); now != original || now == "0" {
+			t.Fatalf("%s: Xray was restarted on the entry (process %s, was %s)", what, now, original)
+		}
+	}
 	apply := func(what string) {
 		t.Helper()
 		op, err := r.installer.Apply(ctx, entry.ID)
@@ -42,10 +63,16 @@ func (r *rig) rulesScenario(t *testing.T, entry *servers.Server, chain *chains.C
 			t.Fatalf("%s: %v", what, err)
 		}
 		r.manager.Wait()
-		if done, _ := r.manager.Get(ctx, op.ID); done.Status != ops.StatusSucceeded {
+		done, _ := r.manager.Get(ctx, op.ID)
+		if done.Status != ops.StatusSucceeded {
 			r.settle(op.ID)
 			t.Fatalf("%s: apply %s, %+v", what, done.Status, done.Error)
 		}
+		if done.Result["restarted"] != false {
+			r.settle(op.ID)
+			t.Fatalf("%s: the apply restarted Xray: %v", what, done.Result)
+		}
+		untouched(what)
 	}
 	save := func(set *rulesets.RuleSet) *rulesets.RuleSet {
 		t.Helper()
@@ -180,6 +207,7 @@ func (r *rig) rulesScenario(t *testing.T, entry *servers.Server, chain *chains.C
 		t.Fatalf("the sweeper's apply did not succeed: %+v", history)
 	}
 	eventually("after the end date", anna, false)
+	untouched("taking a subscription off at its end date")
 	srv, _ := r.servers.Get(ctx, entry.ID)
 	if strings.Contains(srv.Applied.Config, anna.UserID()) {
 		t.Fatal("the ended subscription is still in the applied configuration")

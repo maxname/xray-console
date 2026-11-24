@@ -150,8 +150,8 @@ func (r *Route) balanced() bool {
 // render adds a routing's users, outbounds, balancers and rules to a server
 // configuration that so far only accepts clients and sends them straight out.
 func (routing *Routing) render(config object, clients *[]object, outbounds *[]object) {
-	if routing == nil || (len(routing.Routes) == 0 && len(routing.Policies) == 0) {
-		return
+	if routing == nil {
+		routing = &Routing{}
 	}
 	rules := []object{}
 	balancers := []object{}
@@ -241,13 +241,14 @@ func (routing *Routing) render(config object, clients *[]object, outbounds *[]ob
 		}
 	}
 
-	if len(rules) > 0 {
-		router := object{"domainStrategy": domainStrategy, "rules": rules}
-		if len(balancers) > 0 {
-			router["balancers"] = balancers
-		}
-		config["routing"] = router
+	// Always there, with no rules if there are none: Xray starts a router
+	// that rules can be given to later only when it is told about routing at
+	// all.
+	router := object{"domainStrategy": domainStrategy, "rules": rules}
+	if len(balancers) > 0 {
+		router["balancers"] = balancers
 	}
+	config["routing"] = router
 	if len(watched) > 0 {
 		config["observatory"] = object{
 			"subjectSelector":   watched,

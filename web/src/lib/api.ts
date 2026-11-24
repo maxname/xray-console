@@ -403,6 +403,8 @@ export interface ServerConfig {
   short_ids: string[]
   /** Field keys that differ from what the server runs. */
   changed: string[]
+  /** Applying them restarts Xray; false when it is only clients and rules. */
+  restart: boolean
   diff: DiffLine[]
   /** Desired config.json, private key masked. */
   config: string
@@ -469,6 +471,8 @@ export interface ChainServer {
   changed: string[]
   /** A job, most likely an apply, is running on the server. */
   busy: boolean
+  /** Applying what is waiting restarts Xray there; false for clients and rules alone. */
+  restart: boolean
 }
 
 export interface ChainHop {

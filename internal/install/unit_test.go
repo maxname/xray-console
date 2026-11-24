@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -117,6 +118,8 @@ func refuse(output string) error { return &sshx.ExitError{Code: 1, Output: outpu
 
 type unit struct {
 	t         *testing.T
+	db        *sql.DB
+	planner   *planner.Planner
 	installer *Installer
 	servers   *servers.Store
 	manager   *ops.Manager
@@ -143,7 +146,7 @@ func newUnit(t *testing.T) *unit {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	u := &unit{t: t, servers: servers.NewStore(db, box), server: &fakeServer{}, releases: t.TempDir()}
+	u := &unit{t: t, db: db, servers: servers.NewStore(db, box), server: &fakeServer{}, releases: t.TempDir()}
 	u.manager = ops.NewManager(ctx, db, logger)
 	t.Cleanup(u.manager.Wait)
 	tpl := templates.NewStore(db)
@@ -152,6 +155,7 @@ func newUnit(t *testing.T) *unit {
 	}
 	tplID, _ := tpl.DefaultID(ctx)
 	configPlanner := planner.New(u.servers, tpl, chains.NewStore(db, box))
+	u.planner = configPlanner
 	u.installer = New(u.servers, sshkeys.NewStore(db, box), tpl, configPlanner, xray.NewReleases(u.releases), u.manager, logger)
 	u.installer.dial = func(context.Context, sshx.Target, sshx.Auth, string) (sshx.Remote, error) {
 		return u.server, nil

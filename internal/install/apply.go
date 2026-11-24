@@ -103,7 +103,9 @@ func (i *Installer) Apply(ctx context.Context, serverID int64) (*ops.Operation, 
 		s.close()
 		i.certChanged(serverID)
 		if done.Status == ops.StatusSucceeded {
-			i.Events.Add(events.ConfigApplied, srv.ID, srv.Name, map[string]any{"changed": done.Result["changed"]})
+			i.Events.Add(events.ConfigApplied, srv.ID, srv.Name, map[string]any{
+				"changed": done.Result["changed"], "restarted": done.Result["restarted"],
+			})
 			return
 		}
 		data := map[string]any{}
@@ -144,18 +146,55 @@ func (s *session) applyStage(ctx context.Context, run *ops.Run) error {
 }
 
 func (s *session) applySwap(ctx context.Context, run *ops.Run) error {
-	s.flushTraffic(ctx)
+	srv, err := s.server(ctx)
+	if err != nil {
+		return err
+	}
+	// What is about to change may be something the running Xray can simply
+	// be told: then nobody's connection is dropped for it.
+	var live *xray.LiveChange
+	if srv.Applied != nil {
+		if change, ok := xray.LiveDiff([]byte(srv.Applied.Config), s.plan.Config); ok {
+			live = change
+		}
+	}
+
 	s.backup = fmt.Sprintf("%s/config-%d.json", BackupDir, s.inst.now().Unix())
 	// set -e: without the copy there is nothing to go back to, and a file
 	// that did not move must not be followed by a restart that looks fine.
-	swap := `set -e
+	place := `set -e
 mkdir -p -m 0700 ` + BackupDir + `
 cp -p ` + xray.ConfigPath + ` ` + s.backup + `
-mv -f ` + candidatePath + ` ` + xray.ConfigPath + `
-systemctl restart ` + xray.ServiceName
-	if _, err := s.sudo(ctx, run, swap); err != nil {
-		return withRestored(err, s.restore(ctx, run))
+mv -f ` + candidatePath
+	restart := "systemctl restart " + xray.ServiceName
+
+	if live != nil {
+		// The file first, either way: it is what Xray reads the next time it
+		// starts, whoever starts it.
+		if _, err := s.sudo(ctx, run, place+" "+xray.ConfigPath); err != nil {
+			return withRestored(err, s.restore(ctx, run))
+		}
+		err := s.applyLive(ctx, run, live)
+		if err == nil {
+			s.pruneBackups(ctx)
+			run.SetResult("restarted", false)
+			run.Detail(liveDetail(live))
+			return nil
+		}
+		// Not a failure of the apply: the file is in place, and a restart
+		// makes Xray what the file says — as every apply used to.
+		run.Info("could not be put on the running Xray (" + err.Error() + "); restarting it with the new configuration instead")
+		s.flushTraffic(ctx)
+		if _, err := s.sudo(ctx, run, restart); err != nil {
+			return withRestored(err, s.restore(ctx, run))
+		}
+	} else {
+		s.flushTraffic(ctx)
+		if _, err := s.sudo(ctx, run, place+" "+xray.ConfigPath+"\n"+restart); err != nil {
+			return withRestored(err, s.restore(ctx, run))
+		}
 	}
+	run.SetResult("restarted", true)
 
 	// As at install: give a crash loop time to show itself.
 	state, err := s.sudo(ctx, run, sshx.ServiceSettled(xray.ServiceName, settleSeconds))
@@ -171,11 +210,16 @@ systemctl restart ` + xray.ServiceName
 		})
 	}
 
-	// Keep the newest few backups; the directory must not grow forever.
-	_, _ = s.quietSudo(ctx, "ls -1t "+BackupDir+"/config-*.json 2>/dev/null | tail -n +"+
-		strconv.Itoa(keptBackups+1)+" | xargs -r rm -f")
+	s.pruneBackups(ctx)
 	run.Detail(xray.ServiceName + " · active")
 	return nil
+}
+
+// pruneBackups keeps the newest few replaced configurations; the directory
+// must not grow forever.
+func (s *session) pruneBackups(ctx context.Context) {
+	_, _ = s.quietSudo(ctx, "ls -1t "+BackupDir+"/config-*.json 2>/dev/null | tail -n +"+
+		strconv.Itoa(keptBackups+1)+" | xargs -r rm -f")
 }
 
 func (s *session) applyVerify(ctx context.Context, run *ops.Run) error {

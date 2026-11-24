@@ -111,13 +111,13 @@ func TestPolicyRulesApplyToItsUsersOnlyAndInOrder(t *testing.T) {
 }
 
 func TestAPolicyWithNoUsersRendersNothing(t *testing.T) {
-	_, withEmpty := render(t, &Routing{Policies: []Policy{{
+	config, _ := render(t, &Routing{Policies: []Policy{{
 		Rules: []PolicyRule{{Outbound: "block"}},
 	}}})
 	// Rendered with an empty user list, "block everything" would apply to
 	// every connection the server gets.
-	if strings.Contains(withEmpty, `"routing"`) {
-		t.Fatal("a policy nobody is on produced routing rules")
+	if len(config.Routing.Rules) != 0 {
+		t.Fatalf("a policy nobody is on produced routing rules: %+v", config.Routing.Rules)
 	}
 }
 

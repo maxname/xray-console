@@ -81,6 +81,10 @@ export function EntryApply({
               })}
             </span>
           )}
+          {/* What an apply costs the people who are connected right now. */}
+          <span className="block text-xs text-muted-foreground">
+            {entry.restart ? t('entryApply.restart') : t('entryApply.live')}
+          </span>
         </span>
         <Button size="sm" onClick={() => apply.mutate()}>
           {failed ? t('entryApply.retry') : t('entryApply.apply')}

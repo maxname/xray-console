@@ -171,7 +171,9 @@ Host from the domain (it stays a template field).
   the snapshot recorded at the last successful apply (`servers.Applied`).
 - Editing never touches a server. Applying does: `xray -test` on the new file,
   swap, restart, connection check — and the previous file goes back by itself
-  if the restart or the check fails.
+  if the restart or the check fails. A change that is only clients and rules
+  is put on the running Xray instead of restarting it (see "How routing and
+  subscriptions work").
 - "Apply to all" walks a template's changed servers one at a time.
 
 ## How availability checks work
@@ -242,6 +244,30 @@ Host from the domain (it stays a template field).
 - All of this is part of the entry server's plan (the `policies` field), so a
   new rule or subscription shows on the server as a change to apply; the
   Routing and Clients pages offer that apply themselves.
+- Such an apply does not restart Xray, which would drop every connection of
+  every client of that server. `xray.LiveDiff` compares the configuration the
+  server runs with the one it should: when they differ only in the inbound's
+  users and in the routing rules, the swap step writes the file and then
+  tells the running Xray through its own API on the loopback (`applyLive`):
+  `xray api rmu` for those who go, `adrules` to replace all rules at once,
+  `adu` for those who come — in that order, so that nobody is let in before
+  the rules of their set know them. Xray's client exits as if all were well
+  whatever happened, so the running Xray is then asked who it lets in, and
+  that has to be exactly who it should (`sameUsers`). If anything in this
+  does not work out, Xray is restarted with the new file, as before — the
+  apply does not fail for it. The connection check follows either way, and a
+  failed one puts the previous file back with a restart.
+- A restart is still what it takes for anything Xray reads only when it
+  starts: the inbound's own settings and keys, outbounds and balancers of
+  chains, the domain, and `domainStrategy` — which changes with the first
+  rule by address on a server. `Plan.NeedsRestart` says which it will be, and
+  the pages that offer an apply say so (`restart` in their JSON).
+- A client taken off this way cannot connect again, but connections it has
+  open are not cut: they end by themselves. "Restart Xray" cuts them.
+- For this every server's configuration asks for Xray's HandlerService and
+  RoutingService next to StatsService, and always has a `routing` section,
+  empty if need be — without one Xray starts no router that could be given
+  rules later (`ConfigRevision` 3).
 - `GET /s/<token>` is public: the token is the credential. It answers with the
   `vless://` link (`Inbound.ShareLink`, built from what the server runs) in
   base64, an empty list for a subscription that is off or over, and 404 for
@@ -252,8 +278,9 @@ Host from the domain (it stays a template field).
   subscription past its end date and applies them — only when `policies` is
   the server's sole pending change. Otherwise it logs once and leaves the
   server to the administrator. An apply that does not take the subscription
-  off is not repeated a minute later — every one restarts Xray there: the
-  next comes after 15 minutes, then an hour, then every six hours.
+  off is not repeated a minute later — one that fails puts the previous file
+  back by restarting Xray there: the next comes after 15 minutes, then an
+  hour, then every six hours.
 - A chain cannot be deleted, or have its entry moved, while a rule set sends
   traffic into it; a server cannot be deleted while it is a rule set's entry;
   a rule set cannot be deleted while subscriptions are on it.
@@ -263,8 +290,9 @@ Not built yet from the routing and clients designs: hit counts per rule, the
 and down buttons), a rule set made as a copy of another, updating geosite and
 geoip lists (they are the ones installed with Xray), "local addresses direct"
 (rules run on the server, where that has no meaning), limits and device counts
-(decided against), choosing which chains a subscription may use, adding users
-without restarting Xray, a subscription over several entry servers. The `vless://` link
+(decided against), choosing which chains a subscription may use, cutting the
+open connections of a client that was taken off (Xray has no call for it), a
+subscription over several entry servers. The `vless://` link
 follows the XTLS share-link proposal; it connected in one client app on a real
 server, and other apps have not been tried.
 

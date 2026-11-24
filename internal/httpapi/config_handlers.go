@@ -166,7 +166,10 @@ type configJSON struct {
 	PublicKey     string   `json:"public_key"`
 	ShortIDs      []string `json:"short_ids"`
 	// Changed lists the fields that differ from what the server runs.
-	Changed []string    `json:"changed"`
+	Changed []string `json:"changed"`
+	// Restart: applying them restarts Xray on the server. False when what
+	// changed is only clients and rules, which a running Xray is told.
+	Restart bool        `json:"restart"`
 	Diff    []plan.Line `json:"diff"`
 	// Config is the desired config.json, private key masked.
 	Config                 string        `json:"config"`
@@ -193,6 +196,7 @@ func (s *Server) configView(ctx context.Context, srv *servers.Server) (*configJS
 		Busy:      s.ops.Busy(srv.ID),
 	}
 	view.Template.ID, view.Template.Name, view.Template.Version = p.Template.ID, p.Template.Name, p.Template.Latest.Version
+	view.Restart = len(view.Changed) > 0 && p.NeedsRestart(srv.Applied)
 	if applied := srv.Applied; applied != nil {
 		view.AppliedAt, view.AppliedTemplateVersion = &applied.At, &applied.TemplateVersion
 		view.Diff = plan.Diff(plan.MaskSecrets(applied.Config), view.Config)

@@ -196,8 +196,9 @@ func TestAnApplyThatDoesNotTakeIsNotRepeatedEveryMinute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Every apply restarts Xray on the entry: one that fails must not come
-	// back a minute later, and the minute after that.
+	// An apply that fails ends with Xray restarted on the entry, on its
+	// previous configuration: it must not come back a minute later, and the
+	// minute after that.
 	f.failing = true
 	for _, step := range []struct {
 		after time.Duration

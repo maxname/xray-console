@@ -233,6 +233,27 @@ func TestSubscriptionLifeFromLinkToRemoval(t *testing.T) {
 	if sub.body["state"] != "active" || sub.body["on_server"] != false || !entryPending(sub) {
 		t.Errorf("fresh subscription: %s", sub.raw)
 	}
+	// A client more is something the running Xray is told: applying it costs
+	// nobody their connection, and both places that offer the apply say so.
+	if restart := sub.body["entry"].(map[string]any)["restart"]; restart != false {
+		t.Errorf("a new subscription is said to need a restart of Xray: %v", restart)
+	}
+	if config := h.do("GET", "/api/servers/"+num(entry.ID)+"/config", nil); config.body["restart"] != false {
+		t.Errorf("the server's own page says a restart is needed: %v", config.body["restart"])
+	}
+	// An edited setting of the server itself, on top of it, is not.
+	padding := "300-900"
+	if edited := h.do("PUT", "/api/servers/"+num(entry.ID)+"/config", map[string]any{
+		"overrides": map[string]any{"xhttp.xPaddingBytes": padding},
+	}); edited.status != http.StatusOK || edited.body["restart"] != true {
+		t.Fatalf("an edited setting: %d restart=%v %s", edited.status, edited.body["restart"], edited.raw)
+	}
+	if list := h.do("GET", "/api/subscriptions", nil); list.body["subscriptions"].([]any)[0].(map[string]any)["entry"].(map[string]any)["restart"] != true {
+		t.Errorf("with a setting of the server waiting too, the apply is still said to need no restart: %s", list.raw)
+	}
+	if reset := h.do("POST", "/api/servers/"+num(entry.ID)+"/config/reset", nil); reset.status != http.StatusOK {
+		t.Fatalf("reset: %d %s", reset.status, reset.raw)
+	}
 	h.apply(entry.ID)
 	if applied := h.do("GET", "/api/subscriptions", nil); applied.status != http.StatusOK {
 		t.Fatalf("list: %d", applied.status)

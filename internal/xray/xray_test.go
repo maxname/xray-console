@@ -235,10 +235,20 @@ func TestNoRoutingLeavesAPlainServer(t *testing.T) {
 	if string(plain) != string(empty) {
 		t.Fatal("an empty routing changes the configuration")
 	}
-	for _, absent := range []string{`"routing"`, `"observatory"`, `"balancers"`} {
+	for _, absent := range []string{`"observatory"`, `"balancers"`} {
 		if strings.Contains(string(plain), absent) {
 			t.Errorf("a server in no chain has %s", absent)
 		}
+	}
+	// The routing section is there all the same, empty: without it Xray
+	// starts no router that rules could be given to while it runs.
+	var config struct {
+		Routing *struct {
+			Rules []any `json:"rules"`
+		} `json:"routing"`
+	}
+	if err := json.Unmarshal(plain, &config); err != nil || config.Routing == nil || len(config.Routing.Rules) != 0 {
+		t.Fatalf("routing of a plain server: %+v, %v", config.Routing, err)
 	}
 }
 

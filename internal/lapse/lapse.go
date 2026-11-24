@@ -34,8 +34,9 @@ type Sweeper struct {
 	held map[int64]bool
 	// tried remembers the servers an apply was started on and is still owed:
 	// when, and how many times in a row. An apply that fails leaves the server
-	// exactly as overdue as before, and every attempt restarts Xray there — so
-	// the next one waits, longer each time, instead of coming a minute later.
+	// exactly as overdue as before, and a failed attempt puts the previous
+	// configuration back by restarting Xray there — so the next one waits,
+	// longer each time, instead of coming a minute later.
 	tried map[int64]attempt
 }
 
