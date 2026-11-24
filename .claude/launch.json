@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "xray-console",
+      "runtimeExecutable": "./bin/xray-console",
+      "runtimeArgs": [
+        "serve",
+        "--listen",
+        "127.0.0.1:18080",
+        "--data",
+        "./data"
+      ],
+      "port": 18080
+    }
+  ]
+}

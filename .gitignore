@@ -1,0 +1,10 @@
+# Runtime data: the database and the master key. Never commit.
+/data/
+# Built binary
+/bin/
+/xray-console
+# Built frontend, embedded into the binary. The placeholder keeps the directory
+# so `go build` works before the first `make web`.
+/internal/webui/dist/*
+!/internal/webui/dist/.gitkeep
+.DS_Store
