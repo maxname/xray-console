@@ -301,6 +301,12 @@ func (i *Installer) WithoutDomain(ctx context.Context, operationID int64, maskHo
 	if err := i.Ops.SetParams(ctx, op.ID, params); err != nil {
 		return err
 	}
+	// A stub that is already up — the installation stopped after its step, at
+	// the check — is taken away by that same step, which also writes the
+	// configuration that no longer points at it. So the step is to do again.
+	if err := i.Ops.Reopen(ctx, op.ID, StepSite); err != nil {
+		return err
+	}
 	return i.run(ctx, op, params, password)
 }
 

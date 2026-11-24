@@ -168,6 +168,8 @@ export interface DomainCheck {
   match: boolean
   /** Addresses of the domain that are not known to be the server's. */
   other: string[]
+  /** The domain's IPv6 addresses: the server answers for it on IPv4 only. */
+  ipv6: string[]
 }
 
 export interface CertRenewal {

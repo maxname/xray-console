@@ -125,6 +125,14 @@ function DomainVerdict({
       </span>
     )
   }
+  // The server's own or not: nothing answers for the domain there on 443.
+  if (result.ipv6.length > 0) {
+    return (
+      <span role="status" className="text-destructive">
+        {t('domain.verdict.ipv6', { ipv6: result.ipv6.join(', ') })}
+      </span>
+    )
+  }
   return (
     <>
       <span role="status" className="text-success">

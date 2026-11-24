@@ -80,6 +80,9 @@ const (
 	CodeDomainUnresolved = "domain_unresolved"
 	// CodeDomainMismatch: the domain leads somewhere other than the server.
 	CodeDomainMismatch = "domain_mismatch"
+	// CodeDomainIPv6: the domain has an IPv6 address, and the server answers
+	// for it on IPv4 only.
+	CodeDomainIPv6 = "domain_ipv6"
 	// CodeNginxExists: someone's nginx is on the server already.
 	CodeNginxExists = "nginx_exists"
 	// CodePackagesFailed: the distribution's packages could not be installed.
@@ -250,10 +253,12 @@ func acme(args ...string) string {
 // what. Needs root to see which process owns the socket.
 func (s *session) portHolder(ctx context.Context, run *ops.Run, port int) (map[string]any, bool, error) {
 	text := strconv.Itoa(port)
-	listener, err := s.sudo(ctx, run, "ss -H -ltnp 'sport = :"+text+"' | head -n 1")
+	// Not through a pipe: an ss that fails must not read as a free port.
+	out, err := s.sudo(ctx, run, "ss -H -ltnp 'sport = :"+text+"'")
 	if err != nil {
 		return nil, false, err
 	}
+	listener, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
 	listener = strings.TrimSpace(listener)
 	if listener == "" {
 		return nil, false, nil
@@ -300,6 +305,9 @@ type DomainCheck struct {
 	// Other is the domain's addresses that are not known to be the server's.
 	// The certificate authority may come to any of them.
 	Other []string `json:"other"`
+	// IPv6 is the domain's IPv6 addresses, whoever's they are. Xray answers
+	// on IPv4 only, so over any of them the domain's site would not open.
+	IPv6 []string `json:"ipv6"`
 }
 
 // resolveHost is the panel's own resolver. A name that does not exist is an
@@ -356,12 +364,18 @@ func (i *Installer) CheckDomain(ctx context.Context, domain, host string, own []
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", domain, err)
 	}
-	check := &DomainCheck{Domain: domain, Addresses: addresses(found), Expected: addresses(expected), Other: []string{}}
+	check := &DomainCheck{
+		Domain: domain, Addresses: addresses(found), Expected: addresses(expected),
+		Other: []string{}, IPv6: []string{},
+	}
 	known := map[string]bool{}
 	for _, addr := range check.Expected {
 		known[addr] = true
 	}
 	for _, addr := range check.Addresses {
+		if parsed, err := netip.ParseAddr(addr); err == nil && parsed.Is6() {
+			check.IPv6 = append(check.IPv6, addr)
+		}
 		if known[addr] {
 			check.Match = true
 		} else {
@@ -374,7 +388,9 @@ func (i *Installer) CheckDomain(ctx context.Context, domain, host string, own []
 // domainPointsHere fails unless the domain leads to this server and nowhere
 // else: the certificate authority picks the address it comes to, and one that
 // is another machine's fails the issue in a way that reads like anything but
-// DNS.
+// DNS. An IPv6 address is refused even when it is the server's own: the
+// authority would be answered there, on port 80, but Xray listens on IPv4
+// only, and the domain's site would not open for anyone who comes over IPv6.
 func (s *session) domainPointsHere(ctx context.Context, run *ops.Run, srv *servers.Server, domain string) error {
 	// What the server calls its own: on some hostings the public IPv4 is
 	// somewhere in front of it, but an IPv6 address usually is on the machine.
@@ -400,6 +416,9 @@ func (s *session) domainPointsHere(ctx context.Context, run *ops.Run, srv *serve
 	switch {
 	case len(check.Addresses) == 0:
 		return ops.Fail(CodeDomainUnresolved, domain+" does not resolve", details)
+	case len(check.IPv6) > 0:
+		details["ipv6"] = strings.Join(check.IPv6, ", ")
+		return ops.Fail(CodeDomainIPv6, domain+" has an IPv6 address ("+details["ipv6"].(string)+"); the server answers on IPv4 only", details)
 	case !check.Match || len(check.Other) > 0:
 		return ops.Fail(CodeDomainMismatch, domain+" resolves to "+details["found"].(string)+", not only to this server", details)
 	}
@@ -457,8 +476,13 @@ func tail(text string, limit int) string {
 	return text
 }
 
+// siteConfKept is where the previous configuration waits while nginx judges
+// the new one. nginx reads conf.d/*.conf, so this name is not read.
+const siteConfKept = siteConfPath + ".kept"
+
 // writeSiteConf puts nginx's configuration for the stub in place and has nginx
-// take it. nginx judges the file first; one it rejects is not left there.
+// take it. nginx judges the file first; one it rejects is not left there —
+// the file that was there before, if there was one, goes back.
 func (s *session) writeSiteConf(ctx context.Context, run *ops.Run, domain string, withTLS bool) error {
 	client, err := s.connect(ctx)
 	if err != nil {
@@ -466,6 +490,10 @@ func (s *session) writeSiteConf(ctx context.Context, run *ops.Run, domain string
 	}
 	ipv6, err := s.quietSudo(ctx, "[ -f /proc/net/if_inet6 ] && echo yes || echo no")
 	if err != nil {
+		return err
+	}
+	keep := `if [ -f ` + siteConfPath + ` ]; then cp -p ` + siteConfPath + ` ` + siteConfKept + `; else rm -f ` + siteConfKept + `; fi`
+	if _, err := s.quietSudo(ctx, keep); err != nil {
 		return err
 	}
 	run.Cmd("write " + siteConfPath)
@@ -476,9 +504,16 @@ func (s *session) writeSiteConf(ctx context.Context, run *ops.Run, domain string
 	if out, err := s.sudo(ctx, run, "nginx -t"); err != nil {
 		var exit *sshx.ExitError
 		if errors.As(err, &exit) {
+			back := `if [ -f ` + siteConfKept + ` ]; then mv -f ` + siteConfKept + ` ` + siteConfPath + `; else rm -f ` + siteConfPath + `; fi`
+			if _, undoErr := s.quietSudo(ctx, back); undoErr != nil {
+				info(run, "the rejected configuration could not be taken away: "+undoErr.Error())
+			}
 			return ops.Fail(CodeStubFailed, "nginx rejected the stub site's configuration",
 				map[string]any{"output": tail(out, 1500)})
 		}
+		return err
+	}
+	if _, err := s.quietSudo(ctx, "rm -f "+siteConfKept); err != nil {
 		return err
 	}
 	// set -e: an nginx that could not be told about the file is not asked
@@ -710,16 +745,12 @@ rm -f /etc/nginx/sites-enabled/default`
 		return err
 	}
 
-	// Until there is a certificate nginx can only serve the authority's check.
-	has, err := s.quietSudo(ctx, "[ -s "+sshx.Quote(certPath(domain, "fullchain.pem"))+" ] && [ -s "+
-		sshx.Quote(certPath(domain, "key.pem"))+" ] && echo yes || echo no")
-	if err != nil {
+	// nginx has to be running before acme.sh is asked for anything: the
+	// authority's check comes to it, and so does the reload acme.sh ends
+	// with. Until there is a certificate it can only serve that check; with
+	// one kept from an attempt that failed, it serves the site at once.
+	if err := s.writeSiteConf(ctx, run, domain, s.hasCert(ctx, domain)); err != nil {
 		return err
-	}
-	if strings.TrimSpace(has) != "yes" {
-		if err := s.writeSiteConf(ctx, run, domain, false); err != nil {
-			return err
-		}
 	}
 	if err := s.putACME(ctx, run); err != nil {
 		return err
@@ -777,20 +808,25 @@ func (s *session) moveSite(ctx context.Context, run *ops.Run, domain string) err
 	return nil
 }
 
-// dropCert forgets a domain's certificate: acme.sh stops renewing it and its
-// files go. The certificate itself is not revoked — nobody else has its key.
-func (s *session) dropCert(ctx context.Context, run *ops.Run, domain string) error {
-	script := acme("--remove", "-d", domain, "--ecc") + ` >/dev/null 2>&1 || true
-rm -rf ` + sshx.Quote(siteCertDir+"/"+domain) + ` ` + sshx.Quote(acmeHome+"/"+domain+"_ecc")
-	_, err := s.sudo(ctx, run, script)
-	return err
-}
-
 // --- taking the stub away --------------------------------------------------------------
 
 // undoSite removes the stub site and everything that came with it, nginx
 // included when the panel installed it. run is nil outside an operation.
 func (s *session) undoSite(ctx context.Context, run *ops.Run) error {
+	return s.removeSite(ctx, run, false)
+}
+
+// parkSite removes the stub site but keeps what the certificate authority
+// gave: acme.sh's account and the certificates. It is how an apply that
+// failed takes back a stub it had just set up — the next attempt finds the
+// certificate there and does not ask for another, of which the authority
+// issues only a few a week for one name. What is kept stays in the manifest
+// and goes when the domain is given up or Xray is removed.
+func (s *session) parkSite(ctx context.Context, run *ops.Run) error {
+	return s.removeSite(ctx, run, true)
+}
+
+func (s *session) removeSite(ctx context.Context, run *ops.Run, keepCerts bool) error {
 	srv, err := s.server(ctx)
 	if err != nil {
 		return err
@@ -806,7 +842,7 @@ func (s *session) undoSite(ctx context.Context, run *ops.Run) error {
 systemctl disable --now ` + renewTimer + ` 2>/dev/null || true
 rm -f ` + unitDir + renewService + ` ` + unitDir + renewTimer + `
 systemctl daemon-reload
-rm -f ` + siteConfPath + `
+rm -f ` + siteConfPath + ` ` + siteConfKept + `
 ` + listPackages + `
 pkgs=
 if [ -f ` + packagesOurs + ` ]; then pkgs=$(grep -E '^(nginx|libnginx-mod)[a-z0-9.+-]*$' ` + packagesOurs + ` || [ $? = 1 ]); fi
@@ -816,7 +852,15 @@ DEBIAN_FRONTEND=noninteractive ` + aptGet + ` -y purge $pkgs
 elif systemctl is-active --quiet ` + nginxService + `; then
 systemctl reload ` + nginxService + ` || true
 fi
-rm -rf ` + siteRootDir + ` ` + siteEtcDir + ` ` + siteLibDir
+`
+	if keepCerts {
+		// The lists of packages describe an nginx that is gone now; the next
+		// set-up takes them anew.
+		script += `rm -rf ` + siteRootDir + ` ` + siteLibDir + `
+rm -f ` + packagesBefore + ` ` + packagesOurs
+	} else {
+		script += `rm -rf ` + siteRootDir + ` ` + siteEtcDir + ` ` + siteLibDir
+	}
 	if _, err := s.sudo(ctx, run, script); err != nil {
 		return err
 	}
@@ -827,6 +871,41 @@ rm -rf ` + siteRootDir + ` ` + siteEtcDir + ` ` + siteLibDir
 		if err := s.inst.Servers.RemoveChanges(ctx, s.serverID, kind); err != nil {
 			return err
 		}
+	}
+	if keepCerts {
+		return s.addChange(ctx, changeSite, siteEtcDir+"/")
+	}
+	return nil
+}
+
+// hasCert reports whether a certificate for the domain is on the server.
+func (s *session) hasCert(ctx context.Context, domain string) bool {
+	has, err := s.quietSudo(ctx, "[ -s "+sshx.Quote(certPath(domain, "fullchain.pem"))+" ] && [ -s "+
+		sshx.Quote(certPath(domain, "key.pem"))+" ] && echo yes || echo no")
+	return err == nil && strings.TrimSpace(has) == "yes"
+}
+
+// dropOtherCerts forgets every certificate on the server but the one of the
+// domain it answers for: the one of a name it moved away from, and any that
+// an apply which failed left for its next attempt and that was never used.
+// The names are the server's own account of what is there, so they are never
+// put into a command as text: the loop hands each to acme.sh as one argument.
+func (s *session) dropOtherCerts(ctx context.Context, run *ops.Run, keep string) error {
+	script := `keep=` + sshx.Quote(keep) + `
+for dir in ` + siteCertDir + `/*/; do
+[ -d "$dir" ] || continue
+name=$(basename "$dir")
+[ "$name" = "$keep" ] && continue
+` + acmePath + ` --home ` + acmeHome + ` --config-home ` + acmeHome + ` --remove -d "$name" --ecc >/dev/null 2>&1 || true
+rm -rf "$dir" ` + acmeHome + `/"$name"_ecc
+echo "$name"
+done`
+	out, err := s.quietSudo(ctx, script)
+	if err != nil {
+		return err
+	}
+	for _, name := range strings.Fields(tail(out, 1500)) {
+		info(run, "the certificate of "+name+" is no longer used and was removed")
 	}
 	return nil
 }
@@ -933,22 +1012,29 @@ func (s *session) revertSite(ctx context.Context, run *ops.Run) bool {
 	// Even if the job was cancelled, like the configuration's own way back.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 	defer cancel()
+	// A certificate that was obtained for the new name is kept either way:
+	// asking for it again at every attempt is how a domain gets refused by
+	// the authority for a week.
+	kept := s.hasCert(ctx, s.site.to)
 	var err error
-	if s.site.from == "" {
-		err = s.undoSite(ctx, run)
-	} else {
+	switch {
+	case s.site.from != "":
 		if err = s.revertPage(ctx, s.site.from); err == nil {
 			err = s.writeSiteConf(ctx, run, s.site.from, true)
 		}
-		if err == nil {
-			err = s.dropCert(ctx, run, s.site.to)
-		}
+	case kept:
+		err = s.parkSite(ctx, run)
+	default:
+		err = s.undoSite(ctx, run)
 	}
 	if err != nil {
 		run.Info("could not put the stub site back as it was: " + err.Error())
 		return false
 	}
 	run.Info("the stub site is as it was before")
+	if kept {
+		run.Info("the certificate of " + s.site.to + " stays on the server for the next attempt")
+	}
 	s.site.touched = false
 	return true
 }
@@ -983,9 +1069,9 @@ func (s *session) settleSite(ctx context.Context, run *ops.Run) {
 			return
 		}
 		run.Info("the stub site and its certificate were removed")
-	case s.site != nil && s.site.from != "" && s.site.from != s.site.to:
-		if err := s.dropCert(ctx, run, s.site.from); err != nil {
-			run.Info("the certificate of " + s.site.from + " could not be removed: " + err.Error())
+	case s.plan.Inbound.Domain != "" && hasChange(srv, changeSite):
+		if err := s.dropOtherCerts(ctx, run, s.plan.Inbound.Domain); err != nil {
+			run.Info("certificates the server no longer uses could not be removed: " + err.Error())
 		}
 	}
 }
@@ -1018,9 +1104,13 @@ func (i *Installer) RenewCert(ctx context.Context, serverID int64) (*CertRenewal
 	if srv.Applied == nil || srv.Applied.Inbound == nil || srv.Applied.Inbound.Domain == "" {
 		return nil, ErrNoDomain
 	}
-	if i.Ops.Busy(serverID) {
-		return nil, ops.ErrBusy
+	// Not a job, but nothing else may run on the server meanwhile — a second
+	// renewal least of all: each one is a certificate the authority counts.
+	release, err := i.Ops.Hold(serverID)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
 	domain := srv.Applied.Inbound.Domain
 	s := &session{inst: i, serverID: serverID}
 	defer s.close()

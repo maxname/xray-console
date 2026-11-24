@@ -94,34 +94,72 @@ func (s *session) verify(ctx context.Context, run *ops.Run, inbound *xray.Inboun
 	run.SetResult("http_status", status)
 
 	address := net.JoinHostPort(srv.Host, inbound.PortString())
-	maskHost := inbound.MaskHost()
-	run.Cmd("tls handshake " + address + " (sni " + maskHost + ")")
-	// A server with its own domain shows a certificate the panel's authority
-	// issued; any other, whatever the site it borrows shows.
-	var roots *x509.CertPool
-	if inbound.Domain != "" {
-		roots = s.inst.acme.Roots
-	}
-	elapsed, err := handshake(ctx, address, maskHost, roots)
+	elapsed, err := s.outside(ctx, run, address, inbound)
 	if err != nil {
-		var netErr net.Error
-		var opErr *net.OpError
-		if errors.As(err, &opErr) && opErr.Op == "dial" || errors.As(err, &netErr) && netErr.Timeout() {
-			return ops.Fail(CodePortUnreachable, err.Error(),
-				map[string]any{"address": address, "port": inbound.Port})
-		}
-		if inbound.Domain != "" {
-			// Strangers are handed to the stub site, and what it showed is
-			// not a certificate a browser would take for this name.
-			return ops.Fail(CodeCertInvalid, err.Error(), map[string]any{"domain": inbound.Domain})
-		}
-		return ops.Fail(CodeMaskUnreachable, err.Error(), map[string]any{"mask_host": maskHost})
+		return err
 	}
 	ms := elapsed.Milliseconds()
 	run.Out(fmt.Sprintf("handshake ok, %d ms", ms))
 	run.SetResult("handshake_ms", ms)
 	run.Detail(fmt.Sprintf("REALITY %d ms · XHTTP %d", ms, status))
 	return nil
+}
+
+// outside completes a TLS handshake with the server's port as a stranger
+// would and judges what it is shown. REALITY hands strangers to the masking
+// site, so a valid certificate for that name means the port is reachable and
+// the disguise holds.
+func (s *session) outside(ctx context.Context, run *ops.Run, address string, inbound *xray.Inbound) (time.Duration, error) {
+	maskHost := inbound.MaskHost()
+	if run != nil {
+		run.Cmd("tls handshake " + address + " (sni " + maskHost + ")")
+	}
+	// A server with its own domain shows a certificate the panel's authority
+	// issued; any other, whatever the site it borrows shows.
+	var roots *x509.CertPool
+	if inbound.Domain != "" {
+		roots = s.inst.acme.Roots
+	}
+	elapsed, err := handshake(ctx, address, maskHost, roots, true)
+	if err == nil {
+		return elapsed, nil
+	}
+	var netErr net.Error
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" || errors.As(err, &netErr) && netErr.Timeout() {
+		return 0, ops.Fail(CodePortUnreachable, err.Error(),
+			map[string]any{"address": address, "port": inbound.Port})
+	}
+	if inbound.Domain == "" {
+		return 0, ops.Fail(CodeMaskUnreachable, err.Error(), map[string]any{"mask_host": maskHost})
+	}
+	// Strangers are handed to the stub site, and what it showed is not a
+	// certificate a browser would take for this name. For a job that gives
+	// the server this domain that is its own failure. For any other — an
+	// apply of something else, an update of Xray — it is how the server was
+	// found: a certificate that ran out because its renewal stopped must not
+	// also stop a subscription from being taken off. The certificate's own
+	// watch says so, and the port still has to answer.
+	if s.givesDomain() {
+		return 0, ops.Fail(CodeCertInvalid, err.Error(), map[string]any{"domain": inbound.Domain})
+	}
+	certProblem := err
+	if elapsed, err = handshake(ctx, address, maskHost, roots, false); err != nil {
+		return 0, ops.Fail(CodeCertInvalid, err.Error(), map[string]any{"domain": inbound.Domain})
+	}
+	info(run, "the certificate of "+inbound.Domain+" is not one a visitor would accept ("+
+		certProblem.Error()+"); it was like that before this job, which goes on")
+	if run != nil {
+		run.SetResult("cert_problem", true)
+	}
+	return elapsed, nil
+}
+
+// givesDomain reports whether this job is the one that makes the server answer
+// for its own domain: an installation with one, or an apply that sets or
+// changes it.
+func (s *session) givesDomain() bool {
+	return s.params.Domain != "" || (s.site != nil && s.site.to != "")
 }
 
 // recordApplied notes that the plan is now what the server runs.
@@ -138,24 +176,43 @@ func (s *session) recordApplied(ctx context.Context, p *plan.Plan) error {
 const checkDir = "/run/xray-console"
 
 func (s *session) checkThroughInbound(ctx context.Context, run *ops.Run, inbound *xray.Inbound) (int, error) {
+	// The port for the temporary client is picked here, where nobody knows
+	// what the server has in use. One that turns out to be taken says nothing
+	// about the settings being checked: another is tried, not the job failed
+	// — a failed check is a configuration put back and Xray restarted.
+	for attempt := 1; ; attempt++ {
+		status, taken, err := s.checkOnce(ctx, run, inbound)
+		if !taken || attempt >= checkPortAttempts {
+			return status, err
+		}
+		info(run, "the port picked for the temporary client is in use on the server; trying another")
+	}
+}
+
+// checkPortAttempts is how many ports are tried for the temporary client.
+const checkPortAttempts = 3
+
+// checkOnce is one attempt at the check through the inbound. taken reports
+// that it failed only because the temporary client could not have its port.
+func (s *session) checkOnce(ctx context.Context, run *ops.Run, inbound *xray.Inbound) (status int, taken bool, err error) {
 	client, err := s.connect(ctx)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	port, err := randomPort()
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	config, err := inbound.CheckClientConfig("127.0.0.1", port)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	// A directory only root can enter, not /tmp: the files are written and
 	// the client is started as root, and a name another user of the server
 	// could guess and get to first is how a file ends up somewhere else.
 	if _, err := s.quietSudo(ctx, "install -d -m 0700 "+checkDir); err != nil {
-		return 0, commandFailure(err, client.Target().User)
+		return 0, false, commandFailure(err, client.Target().User)
 	}
 	base := checkDir + "/check-" + strconv.Itoa(port)
 	pid := ""
@@ -172,45 +229,50 @@ func (s *session) checkThroughInbound(ctx context.Context, run *ops.Run, inbound
 		_, _ = s.quietSudo(cleanup, script)
 	}()
 	if err := client.WriteFile(ctx, base+".json", 0o600, strings.NewReader(string(config))); err != nil {
-		return 0, commandFailure(err, client.Target().User)
+		return 0, false, commandFailure(err, client.Target().User)
 	}
 
 	run.Cmd("xray run -config " + base + ".json  # temporary client, socks 127.0.0.1:" + strconv.Itoa(port))
 	// Everything detached from the SSH session, or the command never returns.
 	started, err := s.quietSudo(ctx, "nohup "+xray.BinaryPath+" run -config "+base+".json >"+base+".log 2>&1 </dev/null & echo $!")
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	pid = strings.TrimSpace(started)
 
 	check := s.inst.check
 	run.Cmd("GET " + check.url + " via the inbound")
-	status, err := requestThroughSOCKS(ctx, client, "127.0.0.1:"+strconv.Itoa(port), check, nil)
+	status, err = requestThroughSOCKS(ctx, client, "127.0.0.1:"+strconv.Itoa(port), check, nil)
 	if err != nil {
 		clientLog, _ := s.quietSudo(ctx, "tail -n 15 "+base+".log 2>/dev/null")
 		serverLog, _ := s.quietSudo(ctx, "journalctl -u "+xray.ServiceName+" -n 15 --no-pager -o cat 2>/dev/null")
 		output := strings.TrimSpace(strings.TrimSpace(clientLog) + "\n" + strings.TrimSpace(serverLog))
 		logOutput(run, output)
-		return 0, ops.Fail(CodeCheckFailed, err.Error(), map[string]any{"output": output})
+		// The client's own words, not the server's journal: only the client
+		// was to listen on this port.
+		taken = strings.Contains(clientLog, "address already in use")
+		return 0, taken, ops.Fail(CodeCheckFailed, err.Error(), map[string]any{"output": output})
 	}
 	run.Out(fmt.Sprintf("HTTP %d", status))
 	// Any answer short of an error proves the path; 204 is what the default
 	// URL gives, a redirect is what most other sites give.
 	if status < 200 || status >= 400 {
-		return 0, ops.Fail(CodeCheckFailed, fmt.Sprintf("unexpected HTTP %d from %s", status, check.host),
+		return 0, false, ops.Fail(CodeCheckFailed, fmt.Sprintf("unexpected HTTP %d from %s", status, check.host),
 			map[string]any{"http_status": status})
 	}
-	return status, nil
+	return status, false, nil
 }
 
-// randomPort picks a loopback port for the temporary client, well above the
-// range services usually sit in.
+// randomPort picks a loopback port for the temporary client: above where
+// services usually sit, and below the range Linux hands out to outgoing
+// connections (32768 and up) — a port one of those happens to hold cannot be
+// listened on, and a server with a stub site on its loopback has plenty.
 func randomPort() (int, error) {
-	n, err := rand.Int(rand.Reader, big.NewInt(20000))
+	n, err := rand.Int(rand.Reader, big.NewInt(10000))
 	if err != nil {
 		return 0, err
 	}
-	return 30000 + int(n.Int64()), nil
+	return 20000 + int(n.Int64()), nil
 }
 
 // RequestThroughSOCKS makes the check request through a SOCKS proxy on the far
@@ -359,8 +421,9 @@ func socksConnect(conn io.ReadWriter, host string, port uint16, auth *SOCKSAuth)
 
 // handshake completes a TLS handshake with address as an outsider would,
 // asking for serverName, and reports how long it took. roots is what the
-// certificate is checked against; nil is the system's.
-func handshake(ctx context.Context, address, serverName string, roots *x509.CertPool) (time.Duration, error) {
+// certificate is checked against; nil is the system's. Without verify the
+// certificate is not judged at all: only whether the port answers TLS.
+func handshake(ctx context.Context, address, serverName string, roots *x509.CertPool, verify bool) (time.Duration, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -372,7 +435,9 @@ func handshake(ctx context.Context, address, serverName string, roots *x509.Cert
 	defer conn.Close()
 
 	start := time.Now()
-	secured := tls.Client(conn, &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS13, RootCAs: roots})
+	secured := tls.Client(conn, &tls.Config{
+		ServerName: serverName, MinVersion: tls.VersionTLS13, RootCAs: roots, InsecureSkipVerify: !verify,
+	})
 	if err := secured.HandshakeContext(ctx); err != nil {
 		return 0, fmt.Errorf("TLS handshake as %s: %w", serverName, err)
 	}

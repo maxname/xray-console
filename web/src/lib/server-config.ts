@@ -65,6 +65,7 @@ export const APPLY_ERRORS = [
   // An apply that gives the server a domain sets up the stub site first.
   'domain_unresolved',
   'domain_mismatch',
+  'domain_ipv6',
   'nginx_exists',
   'port_in_use',
   'packages_failed',

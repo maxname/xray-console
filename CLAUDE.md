@@ -56,6 +56,9 @@ left is in the "Not built yet" notes below.
 - The connection check starts a throwaway Xray client on the server and sends
   one HTTPS request through the new inbound over the SSH connection, then does
   a TLS handshake from the panel to the public port.
+  The client's loopback port is picked by the panel, below the range Linux
+  gives to outgoing connections; one that is taken on the server is not a
+  failed check — another is tried (`checkPortAttempts`).
 - Deleting a server from the panel leaves Xray running but takes the panel's
   key off the server and turns password login back on if the panel turned it
   off.
@@ -87,28 +90,44 @@ left is in the "Not built yet" notes below.
   is changed (`sitePreflight`: `port_in_use`, `nginx_exists`), and so does a
   domain that does not lead to the server and nowhere else
   (`domainPointsHere`: the panel resolves the name and compares it with the
-  server's address and the addresses on its interfaces). An installation asks
-  in its system step; an apply, at the start of its stub step.
+  server's address and the addresses on its interfaces). A domain with an
+  IPv6 address is refused too, even the server's own (`domain_ipv6`): Xray
+  listens on IPv4 only, and over IPv6 the domain's site would not open. An
+  installation asks in its system step; an apply, at the start of its stub
+  step.
 - Which nginx packages the panel installed is worked out on the server, by
   comparing with the list of packages taken before (`listPackages`), and only
   those are ever purged. curl, openssl and ca-certificates, if apt added
   them, stay.
 - An installation with a domain has the step `site` between the firewall and
   the connection check; port 80 is the stub's and is opened and closed by its
-  step. When that step — or the checks before it — fail, the installation can
-  be gone on with without the domain (`Installer.WithoutDomain`): the job's
-  params and the server's inbound are changed to someone else's site, and the
-  stub's own step takes away what was set up and gives Xray a configuration
-  that no longer points at it.
+  step. When that step, the checks before it or the connection check after
+  it fail, the installation can be gone on with without the domain
+  (`Installer.WithoutDomain`): the job's params and the server's inbound are
+  changed to someone else's site, and the stub's own step — made a step to
+  do again if it was done already (`ops.Reopen`) — takes away what was set
+  up and gives Xray a configuration that no longer points at it.
 - The domain is part of the plan (`reality.domain`), so giving a server a
   domain, moving it to another or giving it up are changes to apply. An apply
   that sets or changes the domain has `site` as its first step: the stub has
   to answer for the new name before Xray is pointed at it. If anything after
   that fails, the configuration goes back first and the stub after it
-  (`session.restore`), and `restored` covers both. A domain that is given up
-  needs no step: the stub goes once the new settings have passed their check
-  (`settleSite`), and what could not be removed stays in the manifest for the
-  next apply or the removal of Xray. An update of Xray does not touch the stub.
+  (`session.restore`), and `restored` covers both. A certificate that was
+  obtained on the way is not thrown away with the stub (`parkSite`): acme.sh's
+  account and the certificates stay, in the manifest, for the next attempt —
+  the authority issues only a few certificates a week for one name. A domain
+  that is given up needs no step: the stub goes once the new settings have
+  passed their check (`settleSite`, which also removes certificates of names
+  the server no longer answers for), and what could not be removed stays in
+  the manifest for the next apply or the removal of Xray. An update of Xray
+  does not touch the stub.
+- The connection check of a server with a domain wants a certificate a
+  visitor would accept only from the job that gives the server that domain
+  (`session.givesDomain`): an installation with it, an apply that sets or
+  changes it. For any other job — an apply of something else, an update — a
+  certificate that is bad already is said in the log and does not fail it: a
+  renewal that stopped must not also keep a subscription from being taken
+  off.
 - Removing Xray from such a server has a step `site` too, after Xray's files
   and before the ports. Deleting the server from the panel leaves the stub
   and its timer running with Xray.
@@ -123,13 +142,15 @@ left is in the "Not built yet" notes below.
   long before. An overdue one is told once per certificate
   (`alerts.KindCertNotRenewed`, the `on_cert` switch).
 - "Renew now" (`Installer.RenewCert`) runs acme.sh with `--force` over SSH, a
-  one-off command like a restart; the authority's refusals come back as
-  `cert_failed` or `cert_rate_limited`.
+  one-off command, but one that keeps the server to itself while it runs
+  (`ops.Hold`): no job starts there meanwhile, and no second renewal. The
+  authority's refusals come back as `cert_failed` or `cert_rate_limited`.
 - The certificate authority is Let's Encrypt. Only tests name another
   (`Installer.UseACME`): `make integration-domain` runs the whole thing
   against Pebble on a Docker network of its own.
 
-Not built yet from the masking designs: a site of one's own from an archive
+Not built yet from the masking designs: IPv6 for the domain (Xray would have
+to listen there as well), a site of one's own from an archive
 and a mirror of another site as the stub's content (every stub shows the same
 page, which is something an active prober could learn to recognise), adding
 the stub to an nginx that is already on the server, choices when port 80 is

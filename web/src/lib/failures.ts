@@ -22,6 +22,7 @@ const EXPLAINED = [
   'mask_unreachable',
   'domain_unresolved',
   'domain_mismatch',
+  'domain_ipv6',
   'nginx_exists',
   'packages_failed',
   'acme_download_failed',

@@ -27,6 +27,7 @@ import (
 	"xray-console/internal/servers"
 	"xray-console/internal/sshx"
 	"xray-console/internal/templates"
+	"xray-console/internal/xray"
 )
 
 const (
@@ -297,6 +298,41 @@ func TestIntegrationOwnDomain(t *testing.T) {
 	stub("")
 	r.probe(serverID, true)
 
+	// 7a. An apply that fails after the certificate was obtained takes the
+	//     stub away again but keeps what the authority gave: the next
+	//     attempt does not ask it for another certificate.
+	setDomain(testDomain)
+	working := r.installer.check
+	r.installer.check = &checkTarget{url: "https://127.0.0.1:1/", host: "127.0.0.1", port: 1}
+	op = apply()
+	r.installer.check = working
+	if op.Status != ops.StatusFailed || op.Error == nil || op.Error.Step != StepVerify {
+		t.Fatalf("an apply whose check cannot pass: status %s, error %+v", op.Status, op.Error)
+	}
+	if restored := op.Error.Details["restored"]; restored != true {
+		t.Fatalf("restored = %v", restored)
+	}
+	if installed := remote("command -v nginx >/dev/null 2>&1 && echo yes || echo no"); installed != "no" {
+		t.Fatal("the stub was left running after the apply that set it up failed")
+	}
+	if !manifest(changeSite) || manifest(changePackages) {
+		t.Fatalf("the manifest after a failed apply: site=%v packages=%v; the kept certificate should be there and nginx should not",
+			manifest(changeSite), manifest(changePackages))
+	}
+	serial := remote("openssl x509 -noout -serial -in " + certPath(testDomain, "fullchain.pem"))
+	r.probe(serverID, true)
+	op = apply()
+	succeeded(op, "the second attempt at the domain")
+	stub(testDomain)
+	if again := remote("openssl x509 -noout -serial -in " + certPath(testDomain, "fullchain.pem")); again != serial {
+		t.Fatalf("the second attempt asked for another certificate: %s, then %s", serial, again)
+	}
+	r.probe(serverID, true)
+	setDomain("")
+	op = apply()
+	succeeded(op, "giving the domain up again")
+	stub("")
+
 	// 8. Removed, with a rollback of a fresh installation — which this time
 	//    has a domain from the start.
 	// removed takes Xray off the server and waits for the server to leave the
@@ -315,6 +351,33 @@ func TestIntegrationOwnDomain(t *testing.T) {
 		}
 	}
 	removed("removing Xray")
+
+	// 8a. An installation with a domain that stops at the very end — the stub
+	//     is up, the connection check fails — can still be gone on with
+	//     without the domain: the stub's step runs again and takes it away.
+	srv = r.addServer("node-late")
+	serverID = srv.ID
+	r.installer.check = &checkTarget{url: "https://127.0.0.1:1/", host: "127.0.0.1", port: 1}
+	op, err = r.installer.Start(ctx, serverID, Params{Auth: AuthPassword, Domain: testDomain}, r.password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op = r.settle(op.ID)
+	r.installer.check = working
+	if op.Status != ops.StatusFailed || op.Error == nil || op.Error.Step != StepCheck || op.Steps[7].Status != ops.StepDone {
+		t.Fatalf("an installation whose check cannot pass: status %s, error %+v, steps %+v", op.Status, op.Error, op.Steps)
+	}
+	if err := r.installer.WithoutDomain(ctx, op.ID, "www.microsoft.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	op = r.settle(op.ID)
+	succeeded(op, "going on without the domain after the stub was set up")
+	stub("")
+	if config := remote("cat " + xray.ConfigPath); strings.Contains(config, xray.StubListen) {
+		t.Fatal("Xray is still sent to a stub that is gone")
+	}
+	r.probe(serverID, true)
+	removed("removing Xray after going on without the domain")
 
 	srv = r.addServer("node-domain")
 	serverID = srv.ID

@@ -672,8 +672,10 @@ func (s *Server) handleRenewCert(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// The authority answers in seconds, but waits its own retries out.
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	// The authority answers in seconds, but waits its own retries out. Well
+	// inside the server's own limit on writing an answer, so that how it
+	// ended can still be said.
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 	renewal, err := s.installer.RenewCert(ctx, id)
 	if s.configError(w, r, err) {

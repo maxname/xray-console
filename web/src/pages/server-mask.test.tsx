@@ -87,6 +87,7 @@ describe('the masking panel of a server', () => {
       expected: ['203.0.113.14'],
       match: false,
       other: ['198.51.100.200'],
+      ipv6: [],
     })
     const user = userEvent.setup()
     const onUpdate = show({}, null)
@@ -105,5 +106,26 @@ describe('the masking panel of a server', () => {
     // The check is a courtesy: the edit is still the administrator's to make.
     await user.click(screen.getByRole('button', { name: 'Сохранить' }))
     expect(onUpdate).toHaveBeenCalledWith({ domain: 'CDN.example.net' })
+  })
+
+  it('says that an IPv6 address of the domain will not be accepted, the server\'s own or not', async () => {
+    vi.spyOn(api, 'checkDomain').mockResolvedValue({
+      domain: 'cdn.example.net',
+      addresses: ['2001:db8::14', '203.0.113.14'],
+      expected: ['203.0.113.14'],
+      match: true,
+      other: ['2001:db8::14'],
+      ipv6: ['2001:db8::14'],
+    })
+    const user = userEvent.setup()
+    show({}, null)
+
+    await user.click(screen.getByRole('button', { name: 'Изменить домен и маскировку' }))
+    await user.click(screen.getByRole('radio', { name: /Свой домен/ }))
+    await user.type(screen.getByLabelText('Доменное имя'), 'cdn.example.net')
+    await user.click(screen.getByRole('button', { name: 'Проверить запись' }))
+    expect(await screen.findByText(/есть IPv6-адрес \(2001:db8::14\)/)).toBeInTheDocument()
+    // Not the sentence for a name that is fine.
+    expect(screen.queryByText(/Запись найдена/)).not.toBeInTheDocument()
   })
 })

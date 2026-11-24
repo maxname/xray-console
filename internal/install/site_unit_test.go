@@ -344,11 +344,9 @@ func TestMovingToAnotherDomainKeepsThePreviousOneUntilTheChangeIsChecked(t *test
 	if conf := string(u.server.files[siteConfPath]); !strings.Contains(conf, "server_name "+ownDomain+";") {
 		t.Fatalf("the stub was not put back on %s:\n%s", ownDomain, conf)
 	}
-	drop := u.at("'--remove'", "'"+otherDomain+"'")
-	if drop < u.at(restoresXray...) {
-		t.Fatal("the new certificate was dropped before Xray was back on the previous name")
-	}
-	u.never("'--remove'", "'"+ownDomain+"'")
+	// Neither certificate is dropped: the previous name is in use again, and
+	// the new one's — if it was obtained — waits for the next attempt.
+	u.never("--remove")
 	if !u.has(changeSite) || !u.has(changePackages) {
 		t.Fatal("the stub is no longer in the manifest")
 	}
@@ -487,8 +485,9 @@ func TestADomainThatDoesNotLeadToTheServerStopsTheInstallationAtTheStart(t *test
 		u.never("apt-get")
 	}
 
-	// An address of the domain that is the server's own — an IPv6 one the
-	// panel was not given — is not a mismatch.
+	// An IPv6 address of the domain is refused even when it is the server's
+	// own: Xray answers on IPv4 only, and over IPv6 the domain's site would
+	// not open. It is told as that, not as a name that leads elsewhere.
 	u := newUnit(t)
 	u.fresh(func(script string) (string, error, bool) {
 		if strings.Contains(script, "ip -o addr show scope global") {
@@ -499,9 +498,15 @@ func TestADomainThatDoesNotLeadToTheServerStopsTheInstallationAtTheStart(t *test
 	u.installer.resolve = func(context.Context, string) ([]string, error) {
 		return []string{"192.0.2.10", "2001:db8:0:0::10"}, nil
 	}
-	if op := u.install(Params{Domain: ownDomain}); op.Error.Step != StepCheck {
-		t.Fatalf("the server's own IPv6 address was read as someone else's: %+v", op.Error)
+	op := u.install(Params{Domain: ownDomain})
+	if op.Status != ops.StatusFailed || op.Error.Code != CodeDomainIPv6 || op.Error.Step != StepSystem {
+		t.Fatalf("status %s, error %+v", op.Status, op.Error)
 	}
+	if op.Error.Details["ipv6"] != "2001:db8::10" {
+		t.Fatalf("details: %v", op.Error.Details)
+	}
+	u.never("useradd")
+	u.never("apt-get")
 }
 
 func TestAnInstallationCanGoOnWithoutTheDomain(t *testing.T) {
@@ -561,6 +566,165 @@ func TestAnInstallationCanGoOnWithoutTheDomain(t *testing.T) {
 
 	if err := u.installer.WithoutDomain(ctx, op.ID, "www.example.org", ""); !errors.Is(err, ErrNoDomainToDrop) {
 		t.Fatalf("going on without a domain twice: %v", err)
+	}
+}
+
+// after is where a script with these fragments ran at or after index from;
+// the test fails if none did.
+func (u *unit) after(from int, fragments ...string) int {
+	u.t.Helper()
+next:
+	for i := from; i < len(u.server.ran); i++ {
+		for _, fragment := range fragments {
+			if !strings.Contains(u.server.ran[i], fragment) {
+				continue next
+			}
+		}
+		return i
+	}
+	u.t.Fatalf("nothing like %q was run after step %d:\n%s", fragments, from, strings.Join(u.server.ran[from:], "\n---\n"))
+	return -1
+}
+
+func TestGoingOnWithoutTheDomainTakesAwayAStubThatWasAlreadySetUp(t *testing.T) {
+	u := newUnit(t)
+	u.fresh(nil)
+	ctx := context.Background()
+
+	// Everything up to the connection check worked, the stub included.
+	op := u.install(Params{Domain: ownDomain})
+	if op.Status != ops.StatusFailed || op.Error.Step != StepCheck || op.Steps[7].Status != ops.StepDone {
+		t.Fatalf("status %s, error %+v, steps %+v", op.Status, op.Error, op.Steps)
+	}
+	ranBefore := len(u.server.ran)
+
+	if err := u.installer.WithoutDomain(ctx, op.ID, "www.example.org", ""); err != nil {
+		t.Fatal(err)
+	}
+	op = u.finished(op, nil)
+	// The stub's step ran again, although it had been done: it is the one
+	// that takes the stub away and writes a configuration that does not
+	// point at it any more.
+	if detail := op.Steps[7].Detail; op.Steps[7].Status != ops.StepDone || detail != "without a domain · www.example.org" {
+		t.Fatalf("the stub's step: %+v", op.Steps[7])
+	}
+	removal := u.after(ranBefore, removesStub...)
+	swap := u.after(removal, swapsConfig...)
+	if config := string(u.server.files[candidatePath]); strings.Contains(config, xray.StubListen) || !strings.Contains(config, "www.example.org:443") {
+		t.Fatalf("Xray is still sent to the stub:\n%s", config)
+	}
+	// And only then the check, which is what stops a fake server.
+	if op.Error == nil || op.Error.Step != StepCheck {
+		t.Fatalf("status %s, error %+v", op.Status, op.Error)
+	}
+	if check := u.after(swap, "check-"); check < swap {
+		t.Fatal("the check ran before the configuration was rewritten")
+	}
+	if u.has(changeSite) || u.has(changePackages) {
+		t.Fatal("a stub that was removed is still in the manifest")
+	}
+	srv, _ := u.servers.Get(ctx, u.srv.ID)
+	if srv.Inbound.Domain != "" || srv.Inbound.Dest != "www.example.org:443" {
+		t.Fatalf("inbound: %+v", srv.Inbound)
+	}
+}
+
+func TestAFailedApplyKeepsTheCertificateItObtained(t *testing.T) {
+	u := newUnit(t)
+	issued := false
+	u.stubbed(func(script string) (string, error, bool) {
+		switch {
+		case strings.Contains(script, "'--issue'"):
+			issued = true
+		case strings.Contains(script, "fullchain.pem' ] && [ -s"):
+			if issued {
+				return "yes\n", nil, true
+			}
+			return "no\n", nil, true
+		}
+		return "", nil, false
+	})
+	u.wants(ownDomain)
+
+	op := u.apply()
+	if restored := u.failed(op, CodeCheckFailed, StepVerify); restored != true {
+		t.Fatalf("restored = %v", restored)
+	}
+	// The stub goes, as before — but not what the authority gave: asking for
+	// a certificate again at every attempt is how a name gets refused.
+	removal := u.at("purge $pkgs", "rm -rf "+siteRootDir)
+	if script := u.server.ran[removal]; strings.Contains(script, siteEtcDir+" ") || strings.Contains(script, "rm -rf "+siteEtcDir) ||
+		!strings.Contains(script, "rm -f "+packagesBefore) {
+		t.Fatalf("acme.sh's account and the certificate were removed with the stub:\n%s", script)
+	}
+	u.never("--remove")
+	srv, _ := u.servers.Get(context.Background(), u.srv.ID)
+	var kept []string
+	for _, change := range srv.Manifest {
+		if change.Kind == changeSite || change.Kind == changePackages {
+			kept = append(kept, change.Kind+" "+change.Text)
+		}
+	}
+	if len(kept) != 1 || kept[0] != changeSite+" "+siteEtcDir+"/" {
+		t.Fatalf("what is left of the stub is not what the manifest says: %v", kept)
+	}
+
+	// The next attempt finds the certificate. nginx is new again and has to
+	// be running, with the site, before acme.sh is asked to put the
+	// certificate in place: acme.sh ends that with a reload of nginx.
+	ranBefore := len(u.server.ran)
+	delete(u.server.files, siteConfPath)
+	u.apply()
+	nginx := u.after(u.after(ranBefore, installsNginx...), "systemctl reload-or-restart "+nginxService)
+	placed := u.after(ranBefore, "'--install-cert'")
+	if nginx > placed {
+		t.Fatal("acme.sh was asked to reload an nginx that had not been started yet")
+	}
+	if conf := string(u.server.files[siteConfPath]); !strings.Contains(conf, "ssl_certificate ") {
+		t.Fatalf("the stub was not set up with the certificate that was kept:\n%s", conf)
+	}
+}
+
+func TestAConfigurationNginxRejectsIsNotLeftBehind(t *testing.T) {
+	u := newUnit(t)
+	u.stubbed(func(script string) (string, error, bool) {
+		if script == "nginx -t" {
+			return "nginx: [emerg] unknown directive", refuse("nginx: [emerg] unknown directive"), true
+		}
+		return "", nil, false
+	})
+	u.wants(ownDomain)
+
+	op := u.apply()
+	u.failed(op, CodeStubFailed, StepSite)
+	rejected := u.at("nginx -t")
+	// There was no file before this one, so none goes back: it is removed.
+	u.after(rejected, "else rm -f "+siteConfPath+"; fi")
+}
+
+func TestRenewingByHandKeepsTheServerToItself(t *testing.T) {
+	u := newUnit(t)
+	u.stubbed(nil)
+	u.runs(ownDomain)
+	ctx := context.Background()
+
+	// While something else has the server, a renewal does not start: two of
+	// them at once are two certificates the authority counts.
+	release, err := u.installer.Ops.Hold(u.srv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.installer.RenewCert(ctx, u.srv.ID); !errors.Is(err, ops.ErrBusy) {
+		t.Fatalf("a renewal next to something else: %v", err)
+	}
+	u.never("'--renew'")
+	release()
+
+	if _, err := u.installer.RenewCert(ctx, u.srv.ID); err != nil {
+		t.Fatal(err)
+	}
+	if u.installer.Ops.Busy(u.srv.ID) {
+		t.Fatal("the server is still held after the renewal")
 	}
 }
 

@@ -340,6 +340,27 @@ func (m *Manager) SetParams(ctx context.Context, id int64, params any) error {
 	return nil
 }
 
+// Reopen makes a step that was done one that is still to do, in a job that
+// stopped — for a step that has to run again because what it was asked to do
+// has changed since. Steps before and after it are left as they are; a step
+// that was not done is left alone too.
+func (m *Manager) Reopen(ctx context.Context, id int64, stepID string) error {
+	op, err := m.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if op.Status != StatusFailed {
+		return ErrWrongState
+	}
+	for i := range op.Steps {
+		if op.Steps[i].ID == stepID && op.Steps[i].Status == StepDone {
+			op.Steps[i].Status = StepPending
+			return m.save(ctx, op)
+		}
+	}
+	return nil
+}
+
 const columns = `id, server_id, device_id, kind, status, steps, error, params, result, started_at, finished_at`
 
 // Prune deletes jobs that finished before the cutoff, logs with them. The
@@ -499,6 +520,25 @@ func (m *Manager) wasStopped(id int64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.stopped[id]
+}
+
+// Hold reserves a server for something that is done there without a job — a
+// one-off command that must not run next to one, or next to itself. Nothing
+// starts on the server until release is called; ErrBusy when something is
+// running there already.
+func (m *Manager) Hold(serverID int64) (release func(), err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := owner{id: serverID}
+	if _, taken := m.busy[key]; taken {
+		return nil, ErrBusy
+	}
+	m.busy[key] = 0
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		delete(m.busy, key)
+	}, nil
 }
 
 // claim reserves the job's server or device for it, or reports ErrBusy.
