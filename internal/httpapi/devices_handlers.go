@@ -29,7 +29,13 @@ type deviceJSON struct {
 	SocksPort int              `json:"socks_port"`
 	HTTPPort  int              `json:"http_port"`
 	LAN       bool             `json:"lan"`
-	AutoPush  bool             `json:"auto_push"`
+	// ProxyAuth: the proxies ask for ProxyUser and ProxyPassword, which are
+	// given only while they do — they are what the administrator types into
+	// the programs that use the device.
+	ProxyAuth     bool   `json:"proxy_auth"`
+	ProxyUser     string `json:"proxy_user,omitempty"`
+	ProxyPassword string `json:"proxy_password,omitempty"`
+	AutoPush      bool   `json:"auto_push"`
 
 	// Status is new | working | ready | failed; Step, where a job is or
 	// stopped.
@@ -59,7 +65,9 @@ func (s *Server) deviceView(ctx context.Context, dev *devices.Device, cache map[
 		OSName: dev.OSName, Arch: dev.Arch, XrayVersion: dev.XrayVersion,
 		Failure: dev.Failure, Log: dev.Log, Online: dev.Online, Service: dev.Service,
 		Pending: s.deviceManager.Pending(ctx, dev), Traffic: usage[dev.Label()],
+		ProxyAuth: dev.ProxyAuth,
 	}
+	view.ProxyUser, view.ProxyPassword, _ = dev.ProxyCredentials()
 	if !dev.SeenAt.IsZero() {
 		at := dev.SeenAt.Unix()
 		view.SeenAt = &at
@@ -195,13 +203,14 @@ type deviceSettingsRequest struct {
 	SocksPort int    `json:"socks_port"`
 	HTTPPort  int    `json:"http_port"`
 	LAN       bool   `json:"lan"`
+	ProxyAuth bool   `json:"proxy_auth"`
 	AutoPush  bool   `json:"auto_push"`
 }
 
 func (req deviceSettingsRequest) settings() devices.Settings {
 	return devices.Settings{
 		Name: req.Name, RuleSetID: req.RuleSetID, SocksPort: req.SocksPort, HTTPPort: req.HTTPPort,
-		LAN: req.LAN, AutoPush: req.AutoPush,
+		LAN: req.LAN, ProxyAuth: req.ProxyAuth, AutoPush: req.AutoPush,
 	}
 }
 

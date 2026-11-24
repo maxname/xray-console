@@ -44,6 +44,10 @@ import (
 	"xray-console/internal/traffic"
 	"xray-console/internal/webui"
 	"xray-console/internal/xray"
+
+	// The zone names themselves, for a machine that has no zone database —
+	// a minimal container — and would otherwise know only UTC.
+	_ "time/tzdata"
 )
 
 // version is set at build time: -ldflags "-X main.version=1.2.3".
@@ -64,6 +68,8 @@ const usage = `Xray Console — панель управления сервера
                            (по умолчанию https://www.gstatic.com/generate_204, env XRAY_CONSOLE_CHECK_URL)
   --check-interval время   как часто проверять доступность серверов (по умолчанию 1m0s)
   --traffic-interval время как часто снимать счётчики трафика с серверов (по умолчанию 5m0s)
+  --timezone пояс          часовой пояс панели, например Europe/Moscow: по нему идут тихие часы
+                           оповещений и сутки на графиках (по умолчанию пояс системы, env XRAY_CONSOLE_TZ)
   --debug                  подробный журнал
 
 Флаги reset-password:
@@ -122,6 +128,7 @@ func runServe(args []string) error {
 	checkURL := fs.String("check-url", envOr("XRAY_CONSOLE_CHECK_URL", install.DefaultCheckURL), "")
 	checkInterval := fs.Duration("check-interval", probe.DefaultInterval, "")
 	trafficInterval := fs.Duration("traffic-interval", 5*time.Minute, "")
+	timezone := fs.String("timezone", os.Getenv("XRAY_CONSOLE_TZ"), "")
 	debug := fs.Bool("debug", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -130,6 +137,17 @@ func runServe(args []string) error {
 	trusted, err := config.ParseTrustedProxies(*proxies)
 	if err != nil {
 		return err
+	}
+	// The panel's own clock: quiet hours and the days of the graphs go by
+	// it. A machine's zone is whatever it was installed with — in a
+	// container, usually none at all, which is UTC — so it can be named.
+	// Set once, before anything reads the time.
+	if *timezone != "" {
+		zone, err := time.LoadLocation(*timezone)
+		if err != nil {
+			return fmt.Errorf("--timezone %q: такого часового пояса нет; нужно имя вида Europe/Moscow", *timezone)
+		}
+		time.Local = zone
 	}
 	// The panel is made to sit behind a reverse proxy on its own machine. A
 	// panel that listens only there can be reached by nothing else, so the
@@ -248,8 +266,12 @@ func runServe(args []string) error {
 			}
 			return err
 		},
-		Request: func(ctx context.Context, client *sshx.Client, proxyAddr string) (int, error) {
-			return install.RequestThroughSOCKS(ctx, client, proxyAddr, installer.Target())
+		Request: func(ctx context.Context, client *sshx.Client, proxyAddr, user, password string) (int, error) {
+			var auth *install.SOCKSAuth
+			if user != "" {
+				auth = &install.SOCKSAuth{User: user, Password: password}
+			}
+			return install.RequestThroughSOCKS(ctx, client, proxyAddr, installer.Target(), auth)
 		},
 	}
 	localClient := &localclient.Client{
@@ -302,6 +324,7 @@ func runServe(args []string) error {
 		return err
 	}
 	logger.Info("panel is listening", "addr", listener.Addr().String(), "version", version, "data", cfg.DataDir)
+	logger.Info("the panel's clock", "zone", time.Local.String(), "now", time.Now().Format("2006-01-02 15:04 -07:00"))
 	switch {
 	case proxyAssumed:
 		logger.Info("listening on this machine only: a reverse proxy here is believed about who is asking and over what (X-Forwarded-For, X-Forwarded-Proto); it must set both")

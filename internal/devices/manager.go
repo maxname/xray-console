@@ -92,7 +92,7 @@ type Manager struct {
 	EnsureUser func(ctx context.Context, serverID int64, userID string) error
 	// Request makes the check request through a SOCKS proxy on the device's
 	// loopback, reached over the SSH connection.
-	Request func(ctx context.Context, client *sshx.Client, proxyAddr string) (int, error)
+	Request func(ctx context.Context, client *sshx.Client, proxyAddr, user, password string) (int, error)
 	Log     *slog.Logger
 	// Base outlives any one request: jobs run on it.
 	Base context.Context
@@ -168,6 +168,7 @@ func (m *Manager) Desired(ctx context.Context, dev *Device) ([]byte, *servers.Se
 		Address: entry.Host, Inbound: inbound, UUID: dev.UserID(),
 		SocksPort: dev.SocksPort, HTTPPort: dev.HTTPPort, LAN: dev.LAN,
 	}
+	client.ProxyUser, client.ProxyPassword, _ = dev.ProxyCredentials()
 	config, err := client.Config()
 	return config, entry, err
 }
@@ -607,7 +608,10 @@ fi`
 func (j *job) check(ctx context.Context) error {
 	address := "127.0.0.1:" + strconv.Itoa(j.dev.SocksPort)
 	j.logf("request through socks %s on the device", address)
-	status, err := j.m.Request(ctx, j.client, address)
+	// As a program on the device's network would: with the user and
+	// password, when the proxies ask for them.
+	user, password, _ := j.dev.ProxyCredentials()
+	status, err := j.m.Request(ctx, j.client, address, user, password)
 	if err == nil && (status < 200 || status >= 400) {
 		err = fmt.Errorf("unexpected HTTP %d", status)
 	}

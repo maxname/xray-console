@@ -50,6 +50,9 @@ type Device struct {
 	SocksPort int
 	HTTPPort  int
 	LAN       bool
+	// ProxyAuth makes the proxies ask for a user and password. It matters
+	// only with LAN: on the loopback there is nobody to keep out.
+	ProxyAuth bool
 	AutoPush  bool
 
 	Status string
@@ -83,6 +86,20 @@ func (d *Device) Label() string { return fmt.Sprintf("dev-%d", d.ID) }
 // UserID is the device's user id on its entry server.
 func (d *Device) UserID() string { return xray.DeriveUUID(d.secret, "user") }
 
+// ProxyUser is the name the device's proxies ask for when they ask.
+const ProxyUser = "xray"
+
+// ProxyCredentials are the user and password programs on the device's
+// network give its proxies; ok is false when the proxies ask for none. The
+// password comes from the device's secret, so nothing more is stored — and a
+// device made anew has a new one.
+func (d *Device) ProxyCredentials() (user, password string, ok bool) {
+	if !d.LAN || !d.ProxyAuth {
+		return "", "", false
+	}
+	return ProxyUser, strings.ReplaceAll(xray.DeriveUUID(d.secret, "proxy"), "-", "")[:20], true
+}
+
 var (
 	ErrNotFound    = errors.New("device not found")
 	ErrNameTaken   = errors.New("a device with this name already exists")
@@ -101,6 +118,7 @@ type Settings struct {
 	SocksPort int
 	HTTPPort  int
 	LAN       bool
+	ProxyAuth bool
 	AutoPush  bool
 }
 
@@ -129,7 +147,7 @@ func NewStore(db *sql.DB, box *secrets.Box) *Store { return &Store{db: db, box: 
 
 const columns = `id, name, host, ssh_port, ssh_user, host_key, rule_set_id, secret, socks_port, http_port,
 	lan, auto_push, status, step, os_name, arch, xray_version, key_added, applied, failure, log,
-	online, service, seen_at, created_at, updated_at`
+	online, service, seen_at, created_at, updated_at, proxy_auth`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -142,7 +160,7 @@ func (s *Store) scan(row scanner) (*Device, error) {
 	err := row.Scan(&d.ID, &d.Name, &d.Host, &d.SSHPort, &d.SSHUser, &d.HostKey, &d.RuleSetID, &secret,
 		&d.SocksPort, &d.HTTPPort, &d.LAN, &d.AutoPush, &d.Status, &d.Step, &d.OSName, &d.Arch,
 		&d.XrayVersion, &d.KeyAdded, &d.Applied, &failure, &d.Log, &d.Online, &d.Service, &seen,
-		&created, &updated)
+		&created, &updated, &d.ProxyAuth)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -224,9 +242,9 @@ func (s *Store) Create(ctx context.Context, host string, sshPort int, sshUser, h
 	now := time.Now().Unix()
 	result, err := s.db.ExecContext(ctx, `INSERT INTO devices
 		(name, host, ssh_port, ssh_user, host_key, rule_set_id, secret, socks_port, http_port, lan, auto_push,
-		 created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 proxy_auth, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		settings.Name, host, sshPort, sshUser, hostKey, settings.RuleSetID, sealed,
-		settings.SocksPort, settings.HTTPPort, settings.LAN, settings.AutoPush, now, now)
+		settings.SocksPort, settings.HTTPPort, settings.LAN, settings.AutoPush, settings.ProxyAuth, now, now)
 	if err != nil {
 		if store.IsUnique(err) {
 			return nil, ErrNameTaken
@@ -247,9 +265,9 @@ func (s *Store) Update(ctx context.Context, id int64, settings Settings) error {
 		return err
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE devices SET name = ?, rule_set_id = ?, socks_port = ?,
-		http_port = ?, lan = ?, auto_push = ?, updated_at = ? WHERE id = ?`,
+		http_port = ?, lan = ?, auto_push = ?, proxy_auth = ?, updated_at = ? WHERE id = ?`,
 		settings.Name, settings.RuleSetID, settings.SocksPort, settings.HTTPPort, settings.LAN,
-		settings.AutoPush, time.Now().Unix(), id)
+		settings.AutoPush, settings.ProxyAuth, time.Now().Unix(), id)
 	if err != nil {
 		if store.IsUnique(err) {
 			return ErrNameTaken

@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import '@/i18n'
-import { formatBytes, formatPercent } from '@/lib/format'
+import {
+  formatBytes,
+  formatPanelClock,
+  formatPercent,
+} from '@/lib/format'
 
 // The space between a number and its unit does not break.
 const nbsp = '\u00a0'
@@ -28,5 +32,19 @@ describe('formatPercent', () => {
     expect(formatPercent(99.9)).toBe('99,9%')
     expect(formatPercent(57.14)).toBe('57,14%')
     expect(formatPercent(0)).toBe('0%')
+  })
+})
+
+describe('formatPanelClock', () => {
+  it('names the zone and its offset', () => {
+    expect(formatPanelClock('Europe/Moscow', 180)).toBe('Europe/Moscow, UTC+3')
+    expect(formatPanelClock('Asia/Kolkata', 330)).toBe('Asia/Kolkata, UTC+5:30')
+    expect(formatPanelClock('America/New_York', -300)).toBe('America/New_York, UTC−5')
+    expect(formatPanelClock('UTC', 0)).toBe('UTC, UTC+0')
+  })
+
+  it("shows only the offset for the machine's own zone", () => {
+    expect(formatPanelClock('Local', 180)).toBe('UTC+3')
+    expect(formatPanelClock('', 0)).toBe('UTC+0')
   })
 })

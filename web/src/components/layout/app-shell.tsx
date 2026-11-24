@@ -169,9 +169,18 @@ function SidebarFooter() {
 
   return (
     <div className="mt-auto flex items-center gap-1 border-t border-sidebar-border pt-3 pl-2">
-      <span className="min-w-0 flex-1 truncate font-medium" translate="no">
-        {me?.username ?? ''}
-      </span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Link
+            to="/security"
+            className="min-w-0 flex-1 truncate rounded-md font-medium outline-none hover:underline focus-visible:ring-3 focus-visible:ring-ring/50"
+            aria-label={t('security.open', { name: me?.username ?? '' })}
+          >
+            <span translate="no">{me?.username ?? ''}</span>
+          </Link>
+        </TooltipTrigger>
+        <TooltipContent>{t('security.title')}</TooltipContent>
+      </Tooltip>
       <LanguageMenu />
       <ThemeMenu />
       <Tooltip>

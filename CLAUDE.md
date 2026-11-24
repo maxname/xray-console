@@ -234,6 +234,11 @@ yet), a list of commands to finish a removal by hand.
   dropped after ten attempts — most of a day. A list too long for one
   Telegram message is sent in parts. Settings are sealed (they hold the
   bot token) and the token is never sent back to the browser.
+- Quiet hours, the times in messages and the days of the graphs go by the
+  panel's clock: the machine's zone, or `--timezone` (an IANA name; the zone
+  database is built in). It is set once at start as `time.Local`, so code
+  reads it with `.Local()` and never names a zone itself. Changing it moves
+  where a "day" begins for history already recorded.
 - The sentences alerts send are Russian, in `internal/alerts/messages.go` —
   the one place where text for people is written in Go.
 
@@ -273,6 +278,11 @@ per-chain traffic, the checks' settings screen.
   start with is replaced by the previous one, and the same configuration is
   then not sent again at once: after 5 minutes, then 30, then every 3 hours.
   A job on a device has 20 minutes.
+- A device's proxies, when open to its network (`lan`), can ask for a user
+  and password (`proxy_auth`). The password is derived from the device's
+  secret, shown in the device's dialog and nowhere stored; the check after a
+  push signs in with it (`install.SOCKSAuth`). Off by default: not every
+  program can do SOCKS with a password.
 - Deleting a device takes the client off it and the panel's key too if the
   panel put it there; a device that cannot be reached is deleted from the
   panel only, and the answer says so.
@@ -317,7 +327,12 @@ importing other SSH keys.
 ## Layout
 
 - `cmd/xray-console` — the binary: `serve`, `reset-password`, `version`.
-- `internal/auth` — the administrator account, sessions, lockout, TOTP.
+- `internal/auth` — the administrator account, sessions, lockout, TOTP. The
+  account is managed on the Security page (`web/src/pages/security.tsx`):
+  changing the password signs every other browser out; two-factor sign-in
+  is turned on with the password and a confirmed code and off with the
+  password and a code; sessions are listed and ended by an id that is the
+  start of the token's stored hash, never the token.
 - `internal/servers` — the servers the panel manages and their manifests.
 - `internal/sshx` — SSH client: pinned host keys, commands, file uploads.
 - `internal/sshkeys` — the panel's own SSH key.
@@ -394,6 +409,15 @@ importing other SSH keys.
   naming the codes its own `<namespace>.errors` has; special cases come
   before it. `i18n/catalogue.test.ts` fails on a key the code asks for and
   the catalogue lacks.
+- A page file holds the page; its dialogs and editors live next to it
+  (`routing-editors.tsx`, `device-dialogs.tsx`, `template-dialogs.tsx`,
+  `chain-editor.tsx`, `alerts-dialog.tsx`, `server-apply.tsx`, …) and what
+  is not a component — error lists, query keys, request builders — in
+  `lib/<page>.ts`. Parts several pages use are in `components/`
+  (`operation-view`, `server-parts`, `failure-explained`).
+- A failure's details reach the translator only through `failureValues`
+  (`lib/failures.ts`): they come from the backend and from servers' output,
+  and a detail called `count` or `defaultValue` must not pick the sentence.
 - One of several options is a `Segmented` (a radio group with arrow keys),
   not hand-made buttons with `role="tab"`.
 - Deleting anything takes two clicks: a typed name for a server, the

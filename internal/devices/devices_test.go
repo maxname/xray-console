@@ -328,3 +328,69 @@ func TestSettingsThatDidNotTakeAreNotSentAgainEveryMinute(t *testing.T) {
 		t.Fatal("a device whose settings took was still made to wait")
 	}
 }
+
+func TestProxiesOpenToANetworkCanAskForAPassword(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.apply()
+	settings := f.settings("Роутер дома")
+	dev, err := f.store.Create(ctx, "192.168.1.1", 22, "root", "k", settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.apply()
+	open, _, err := f.manager.Desired(ctx, dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, asks := dev.ProxyCredentials(); asks || strings.Contains(string(open), `"accounts"`) {
+		t.Fatal("a device that was not asked to has a proxy password")
+	}
+
+	// On the loopback there is nobody to keep out: the setting waits for LAN.
+	settings.ProxyAuth = true
+	if err := f.store.Update(ctx, dev.ID, settings); err != nil {
+		t.Fatal(err)
+	}
+	dev, _ = f.store.Get(ctx, dev.ID)
+	if _, _, asks := dev.ProxyCredentials(); asks {
+		t.Fatal("proxies on the loopback ask for a password")
+	}
+
+	settings.LAN = true
+	if err := f.store.Update(ctx, dev.ID, settings); err != nil {
+		t.Fatal(err)
+	}
+	dev, _ = f.store.Get(ctx, dev.ID)
+	user, password, asks := dev.ProxyCredentials()
+	if !asks || user != ProxyUser || len(password) != 20 {
+		t.Fatalf("credentials: %q %q %v", user, password, asks)
+	}
+	// The password is not the device's user id on the server, nor part of it.
+	if strings.Contains(strings.ReplaceAll(dev.UserID(), "-", ""), password) {
+		t.Fatal("the proxy password gives away the device's user id")
+	}
+	closed, _, err := f.manager.Desired(ctx, dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"auth": "password"`, `"user": "` + user + `"`, `"pass": "` + password + `"`} {
+		if !strings.Contains(string(closed), want) {
+			t.Fatalf("the configuration lacks %s:\n%s", want, closed)
+		}
+	}
+	// Both proxies, not only SOCKS.
+	if strings.Count(string(closed), `"accounts"`) != 2 {
+		t.Fatalf("accounts on %d of the two proxies", strings.Count(string(closed), `"accounts"`))
+	}
+	// Another device has a password of its own.
+	other, err := f.store.Create(ctx, "192.168.1.2", 22, "root", "k", Settings{
+		Name: "Второй", RuleSetID: settings.RuleSetID, SocksPort: 10808, HTTPPort: 10809, LAN: true, ProxyAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, otherPassword, _ := other.ProxyCredentials(); otherPassword == password {
+		t.Fatal("two devices share a proxy password")
+	}
+}

@@ -134,6 +134,14 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/auth/login", s.limited(signIn, s.handleLogin))
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	api.Handle("POST /api/auth/totp/confirm", s.requireAuth(s.handleTOTPConfirm))
+	// These ask for the password again. Limited like sign-in itself: a
+	// session left open must not be a place to guess the password from.
+	api.Handle("POST /api/auth/password", s.requireAuth(s.limited(signIn, s.handleChangePassword)))
+	api.Handle("POST /api/auth/totp", s.requireAuth(s.limited(signIn, s.handleBeginTOTP)))
+	api.Handle("POST /api/auth/totp/disable", s.requireAuth(s.limited(signIn, s.handleDisableTOTP)))
+	api.Handle("GET /api/auth/sessions", s.requireAuth(s.handleListSessions))
+	api.Handle("POST /api/auth/sessions/revoke-others", s.requireAuth(s.handleRevokeOtherSessions))
+	api.Handle("DELETE /api/auth/sessions/{id}", s.requireAuth(s.handleRevokeSession))
 	api.Handle("GET /api/me", s.requireAuth(s.handleMe))
 
 	api.Handle("GET /api/ssh/panel-key", s.requireAuth(s.handlePanelKey))

@@ -173,7 +173,7 @@ func (s *session) checkThroughInbound(ctx context.Context, run *ops.Run, inbound
 
 	check := s.inst.check
 	run.Cmd("GET " + check.url + " via the inbound")
-	status, err := requestThroughSOCKS(ctx, client, "127.0.0.1:"+strconv.Itoa(port), check)
+	status, err := requestThroughSOCKS(ctx, client, "127.0.0.1:"+strconv.Itoa(port), check, nil)
 	if err != nil {
 		clientLog, _ := s.quietSudo(ctx, "tail -n 15 "+base+".log 2>/dev/null")
 		serverLog, _ := s.quietSudo(ctx, "journalctl -u "+xray.ServiceName+" -n 15 --no-pager -o cat 2>/dev/null")
@@ -204,8 +204,13 @@ func randomPort() (int, error) {
 // RequestThroughSOCKS makes the check request through a SOCKS proxy on the far
 // machine's loopback, reached over the SSH connection — for a client the panel
 // set up somewhere other than on a server.
-func RequestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr string, check *checkTarget) (int, error) {
-	return requestThroughSOCKS(ctx, client, proxyAddr, check)
+func RequestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr string, check *checkTarget, auth *SOCKSAuth) (int, error) {
+	return requestThroughSOCKS(ctx, client, proxyAddr, check, auth)
+}
+
+// SOCKSAuth is the user and password a SOCKS proxy asks for.
+type SOCKSAuth struct {
+	User, Password string
 }
 
 // Target is the URL the connection check requests, as the installer is set
@@ -214,7 +219,7 @@ func (i *Installer) Target() *checkTarget { return i.check }
 
 // requestThroughSOCKS reaches the SOCKS proxy on the server's loopback through
 // the SSH connection and makes the check request through it.
-func requestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr string, check *checkTarget) (int, error) {
+func requestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr string, check *checkTarget, auth *SOCKSAuth) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
@@ -238,7 +243,7 @@ func requestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr stri
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
-	if err := socksConnect(conn, check.host, check.port); err != nil {
+	if err := socksConnect(conn, check.host, check.port, auth); err != nil {
 		return 0, err
 	}
 	secured := tls.Client(conn, &tls.Config{ServerName: check.host, MinVersion: tls.VersionTLS12})
@@ -262,18 +267,49 @@ func requestThroughSOCKS(ctx context.Context, client sshx.Remote, proxyAddr stri
 	return resp.StatusCode, nil
 }
 
-// socksConnect performs a SOCKS5 CONNECT to host:port, no authentication.
-// The host goes as a name so that it is resolved at the far end.
-func socksConnect(conn io.ReadWriter, host string, port uint16) error {
-	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
+// socksConnect performs a SOCKS5 CONNECT to host:port, with a user and
+// password when auth is given and the proxy asks for them (RFC 1929). The
+// host goes as a name so that it is resolved at the far end.
+func socksConnect(conn io.ReadWriter, host string, port uint16, auth *SOCKSAuth) error {
+	if len(host) > 255 {
+		return errors.New("SOCKS: the host name is too long")
+	}
+	// Methods on offer: none, and user/password when there is one to give.
+	offer := []byte{5, 1, 0}
+	if auth != nil {
+		if len(auth.User) > 255 || len(auth.Password) > 255 {
+			return errors.New("SOCKS: the user or password is too long")
+		}
+		offer = []byte{5, 2, 0, 2}
+	}
+	if _, err := conn.Write(offer); err != nil {
 		return err
 	}
 	var greeting [2]byte
 	if _, err := io.ReadFull(conn, greeting[:]); err != nil {
 		return fmt.Errorf("SOCKS greeting: %w", err)
 	}
-	if greeting[0] != 5 || greeting[1] != 0 {
-		return errors.New("SOCKS proxy refused the no-authentication method")
+	switch {
+	case greeting[0] != 5:
+		return errors.New("not a SOCKS5 proxy")
+	case greeting[1] == 0:
+	case greeting[1] == 2 && auth != nil:
+		credentials := append([]byte{1, byte(len(auth.User))}, auth.User...)
+		credentials = append(append(credentials, byte(len(auth.Password))), auth.Password...)
+		if _, err := conn.Write(credentials); err != nil {
+			return err
+		}
+		var verdict [2]byte
+		if _, err := io.ReadFull(conn, verdict[:]); err != nil {
+			return fmt.Errorf("SOCKS sign-in: %w", err)
+		}
+		if verdict[1] != 0 {
+			return errors.New("SOCKS proxy refused the user and password")
+		}
+	case auth == nil:
+		return errors.New("SOCKS proxy asks for a user and password")
+	default:
+		return errors.New("SOCKS proxy accepts none of the ways to sign in")
 	}
 
 	request := []byte{5, 1, 0, 3, byte(len(host))}

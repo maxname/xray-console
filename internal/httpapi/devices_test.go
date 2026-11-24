@@ -231,3 +231,47 @@ func TestARuleSetTheLocalClientUsesStays(t *testing.T) {
 		t.Fatalf("the client after its set was deleted: %s", after.raw)
 	}
 }
+
+func TestADevicesProxyPasswordIsShownOnlyWhileItIsAskedFor(t *testing.T) {
+	h := newHarness(t)
+	h.setup()
+	entry := h.readyServer("entry")
+	set := h.do("POST", "/api/rule-sets", map[string]any{"name": "Дом", "entry_server_id": entry.ID, "default_action": "direct"})
+	hostKey, _ := h.do("GET", "/api/ssh/panel-key", nil).body["public_key"].(string)
+	body := map[string]any{
+		"name": "Роутер дома", "host": "127.0.0.1", "ssh_port": 1, "ssh_user": "root", "host_key": hostKey,
+		"password": "", "rule_set_id": id(set), "socks_port": 10808, "http_port": 10809,
+		"lan": true, "proxy_auth": true, "auto_push": false,
+	}
+	created := h.do("POST", "/api/devices", body)
+	if created.status != http.StatusCreated {
+		t.Fatalf("create: %d %s", created.status, created.raw)
+	}
+	device := func(resp response) map[string]any {
+		t.Helper()
+		list, _ := resp.body["devices"].([]any)
+		if len(list) != 1 {
+			t.Fatalf("devices: %s", resp.raw)
+		}
+		return list[0].(map[string]any)
+	}
+	shown := device(h.do("GET", "/api/devices", nil))
+	password, _ := shown["proxy_password"].(string)
+	if shown["proxy_auth"] != true || shown["proxy_user"] != "xray" || len(password) != 20 {
+		t.Fatalf("a device whose proxies ask for a password: %v", shown)
+	}
+
+	// Switched off, there is no password to show — and none is sent.
+	path := "/api/devices/" + num(int64(shown["id"].(float64)))
+	settings := map[string]any{
+		"name": "Роутер дома", "rule_set_id": id(set), "socks_port": 10808, "http_port": 10809,
+		"lan": true, "proxy_auth": false, "auto_push": false,
+	}
+	if resp := h.do("PUT", path, settings); resp.status != http.StatusOK {
+		t.Fatalf("update: %d %s", resp.status, resp.raw)
+	}
+	hidden := device(h.do("GET", "/api/devices", nil))
+	if hidden["proxy_auth"] != false || hidden["proxy_password"] != nil || hidden["proxy_user"] != nil {
+		t.Fatalf("a device whose proxies ask for nothing: %v", hidden)
+	}
+}

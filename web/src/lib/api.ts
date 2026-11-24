@@ -42,9 +42,28 @@ export interface Me {
   totp_pending: boolean
   panel_url: string
   version: string
+  /** The panel's clock: an IANA name, or "Local" for the machine's own zone. */
+  timezone: string
+  utc_offset_minutes: number
   /** Unix timestamp, seconds. */
   last_login_at: number | null
   last_login_ip: string | null
+}
+
+/** One signed-in browser. */
+export interface AccountSession {
+  /** Names the session; it is not the session's own secret. */
+  id: string
+  /** Unix timestamps, seconds. */
+  created_at: number
+  last_seen_at: number
+  expires_at: number
+  /** Signed in with "stay signed in for 30 days". */
+  remember: boolean
+  ip: string
+  user_agent: string
+  /** The browser that is asking. */
+  current: boolean
 }
 
 /** `details` of an `invalid_credentials` error. */
@@ -519,6 +538,11 @@ export interface Device {
   http_port: number
   /** The proxies listen on every interface, for the device's network. */
   lan: boolean
+  /** The proxies ask for a user and password (it matters only with `lan`). */
+  proxy_auth: boolean
+  /** What they ask for; present only while they do. */
+  proxy_user?: string
+  proxy_password?: string
   /** Changed settings are sent without being asked. */
   auto_push: boolean
   status: 'new' | 'working' | 'ready' | 'failed'
@@ -544,6 +568,7 @@ export interface DeviceSettings {
   socks_port: number
   http_port: number
   lan: boolean
+  proxy_auth: boolean
   auto_push: boolean
 }
 
@@ -841,6 +866,24 @@ export const api = {
     request<OkResponse>('POST', '/api/auth/totp/confirm', { code }),
 
   me: () => request<Me>('GET', '/api/me'),
+
+  changePassword: (current: string, next: string) =>
+    request<OkResponse>('POST', '/api/auth/password', {
+      current_password: current,
+      new_password: next,
+    }),
+
+  beginTotp: (password: string) => request<TotpEnrollment>('POST', '/api/auth/totp', { password }),
+
+  disableTotp: (password: string, code: string) =>
+    request<OkResponse>('POST', '/api/auth/totp/disable', { password, code }),
+
+  getSessions: () => request<{ sessions: AccountSession[] }>('GET', '/api/auth/sessions'),
+
+  revokeSession: (id: string) => request<OkResponse>('DELETE', `/api/auth/sessions/${id}`),
+
+  revokeOtherSessions: () =>
+    request<{ ok: true; ended: number }>('POST', '/api/auth/sessions/revoke-others'),
 
   getPanelKey: () => request<PanelKey>('GET', '/api/ssh/panel-key'),
 

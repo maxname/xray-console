@@ -18,6 +18,11 @@ type Client struct {
 	// LAN makes the proxies listen on every interface rather than on the
 	// loopback: a router's whole network can then use them.
 	LAN bool
+	// ProxyUser and ProxyPassword, when set, are what the proxies ask every
+	// program for: a proxy open to a network is otherwise open to everyone
+	// on it, and to everyone who can reach it from outside.
+	ProxyUser     string
+	ProxyPassword string
 	// Quiet turns Xray's own log off — for the client built into the panel,
 	// which shares the panel's output.
 	Quiet bool
@@ -31,11 +36,17 @@ func (c *Client) Config() ([]byte, error) {
 	if c.LAN {
 		listen = "0.0.0.0"
 	}
+	socks, http := object{"udp": true}, object{}
+	if c.ProxyUser != "" && c.ProxyPassword != "" {
+		accounts := []object{{"user": c.ProxyUser, "pass": c.ProxyPassword}}
+		socks["auth"], socks["accounts"] = "password", accounts
+		http["accounts"] = accounts
+	}
 	inbounds := []object{}
 	if c.SocksPort != 0 {
 		inbounds = append(inbounds, object{
 			"tag": "socks", "listen": listen, "port": c.SocksPort, "protocol": "socks",
-			"settings": object{"udp": true},
+			"settings": socks,
 			// So that the server sees names, and its rules by name apply,
 			// even when a program resolved the address itself.
 			"sniffing": object{"enabled": true, "destOverride": []string{"http", "tls", "quic"}},
@@ -44,6 +55,7 @@ func (c *Client) Config() ([]byte, error) {
 	if c.HTTPPort != 0 {
 		inbounds = append(inbounds, object{
 			"tag": "http", "listen": listen, "port": c.HTTPPort, "protocol": "http",
+			"settings": http,
 			"sniffing": object{"enabled": true, "destOverride": []string{"http", "tls"}},
 		})
 	}

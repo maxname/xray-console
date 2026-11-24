@@ -36,8 +36,12 @@ func (r *rig) deviceScenario(t *testing.T, serverID int64) {
 			}
 			return err
 		},
-		Request: func(ctx context.Context, client *sshx.Client, proxyAddr string) (int, error) {
-			return RequestThroughSOCKS(ctx, client, proxyAddr, r.installer.Target())
+		Request: func(ctx context.Context, client *sshx.Client, proxyAddr, user, password string) (int, error) {
+			var auth *SOCKSAuth
+			if user != "" {
+				auth = &SOCKSAuth{User: user, Password: password}
+			}
+			return RequestThroughSOCKS(ctx, client, proxyAddr, r.installer.Target(), auth)
 		},
 	}
 	remote := func(script string) string {
@@ -160,6 +164,51 @@ func (r *rig) deviceScenario(t *testing.T, serverID int64) {
 	}
 	if got := remote("ss -H -ltn 'sport = :10808'"); !strings.Contains(got, "127.0.0.1:10808") {
 		t.Fatalf("after the failed push the old SOCKS port: %q", got)
+	}
+	if err := store.Update(ctx, dev.ID, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3a. Open to the device's network, asking for a password. The client
+	//     starts with it, the check signs in to get through — and whoever
+	//     has no password gets nothing.
+	guarded := settings
+	guarded.LAN, guarded.ProxyAuth = true, true
+	if err := store.Update(ctx, dev.ID, guarded); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Push(ctx, dev.ID); err != nil {
+		t.Fatal(err)
+	}
+	dev = settle("push with a proxy password", dev.ID)
+	if dev.Failure != nil || manager.Pending(ctx, dev) {
+		t.Fatalf("with a proxy password: %+v\n%s", dev.Failure, dev.Log)
+	}
+	user, password, asks := dev.ProxyCredentials()
+	if !asks {
+		t.Fatal("the device has no proxy credentials")
+	}
+	if got := remote("ss -H -ltn 'sport = :10808'"); !strings.Contains(got, "0.0.0.0:10808") && !strings.Contains(got, "*:10808") {
+		t.Fatalf("the SOCKS port is not open to the network: %q", got)
+	}
+	through := func(auth *SOCKSAuth) error {
+		s := &session{inst: r.installer, serverID: serverID}
+		defer s.close()
+		client, err := s.connect(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = RequestThroughSOCKS(ctx, client, "127.0.0.1:10808", r.installer.Target(), auth)
+		return err
+	}
+	if err := through(&SOCKSAuth{User: user, Password: password}); err != nil {
+		t.Fatalf("through the proxy with its password: %v", err)
+	}
+	if err := through(nil); err == nil {
+		t.Fatal("the proxy let a request through without a password")
+	}
+	if err := through(&SOCKSAuth{User: user, Password: "a guess"}); err == nil {
+		t.Fatal("the proxy let a request through with a wrong password")
 	}
 	if err := store.Update(ctx, dev.ID, settings); err != nil {
 		t.Fatal(err)

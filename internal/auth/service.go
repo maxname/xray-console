@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -571,6 +572,189 @@ func (s *Service) Profile(ctx context.Context) (*Profile, error) {
 		LastLoginAt: a.LastLoginAt,
 		LastLoginIP: a.LastLoginIP,
 	}, nil
+}
+
+// ErrWrongPassword: what was given as the current password is not it.
+var ErrWrongPassword = errors.New("the current password is wrong")
+
+// ErrTOTPAlreadyOn: two-factor sign-in is on; it has to be turned off before
+// a new secret is issued.
+var ErrTOTPAlreadyOn = errors.New("two-factor sign-in is already on")
+
+// ErrTOTPOff: there is no two-factor sign-in to turn off.
+var ErrTOTPOff = errors.New("two-factor sign-in is not on")
+
+// ErrSessionNotFound: no session has this id.
+var ErrSessionNotFound = errors.New("session not found")
+
+// confirmPassword checks the current password. Everything that changes how
+// the account is protected asks for it again: a browser left open, or a
+// stolen session, is not the administrator.
+func (s *Service) confirmPassword(ctx context.Context, password string) (*admin, error) {
+	a, err := s.loadAdmin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ok, err := VerifyPassword(a.PasswordHash, password)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrWrongPassword
+	}
+	return a, nil
+}
+
+// ChangePassword replaces the password, given the current one, and signs out
+// every browser but the one that asked (keepToken): whoever else was signed
+// in with the old password is not any more.
+func (s *Service) ChangePassword(ctx context.Context, current, next, keepToken string) error {
+	if err := ValidatePassword(next); err != nil {
+		return err
+	}
+	if _, err := s.confirmPassword(ctx, current); err != nil {
+		return err
+	}
+	hash, err := HashPassword(next)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE admin SET password_hash = ? WHERE id = 1`, hash); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash != ?`, hashToken(keepToken)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BeginTOTP issues a new two-factor secret, given the password. Sign-in does
+// not ask for codes until ConfirmTOTP has seen one: a secret that never made
+// it into the authenticator app must not lock the administrator out.
+func (s *Service) BeginTOTP(ctx context.Context, password string) (*TOTPEnrollment, error) {
+	a, err := s.confirmPassword(ctx, password)
+	if err != nil {
+		return nil, err
+	}
+	if a.TOTPEnabled {
+		return nil, ErrTOTPAlreadyOn
+	}
+	secret, err := NewTOTPSecret()
+	if err != nil {
+		return nil, err
+	}
+	sealed, err := s.box.Seal(secret)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE admin SET totp_secret = ?, totp_enabled = 0, totp_last_step = 0 WHERE id = 1`, sealed); err != nil {
+		return nil, err
+	}
+	return &TOTPEnrollment{Secret: EncodeTOTPSecret(secret), URL: TOTPURL(secret, totpIssuer, a.Username)}, nil
+}
+
+// DisableTOTP turns two-factor sign-in off, given the password and a current
+// code: both, because this is what an intruder would do first. Without the
+// phone there is `reset-password --disable-2fa` on the panel's own machine.
+func (s *Service) DisableTOTP(ctx context.Context, password, code string) error {
+	a, err := s.confirmPassword(ctx, password)
+	if err != nil {
+		return err
+	}
+	if !a.TOTPEnabled {
+		// A secret issued and never confirmed is simply dropped.
+		if len(a.TOTPSecret) == 0 {
+			return ErrTOTPOff
+		}
+	} else {
+		secret, err := s.box.Open(a.TOTPSecret)
+		if err != nil {
+			return err
+		}
+		if _, ok := VerifyTOTP(secret, normalizeCode(code), s.now()); !ok {
+			return ErrTOTPInvalid
+		}
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE admin SET totp_secret = NULL, totp_enabled = 0, totp_last_step = 0 WHERE id = 1`)
+	return err
+}
+
+// SessionInfo is one signed-in browser, as the administrator sees it.
+type SessionInfo struct {
+	// ID names the session without being the way into it: the start of the
+	// stored hash of its token.
+	ID         string
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+	Remember   bool
+	IP         string
+	UserAgent  string
+	// Current: the session that is asking.
+	Current bool
+}
+
+// sessionIDLength is how much of a token's hash names a session: 16 hex
+// characters, far more than enough to tell a handful apart.
+const sessionIDLength = 16
+
+// Sessions lists the live sessions, the most recently used first.
+func (s *Service) Sessions(ctx context.Context, currentToken string) ([]SessionInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT hex(token_hash), created_at, last_seen_at, expires_at,
+		remember, ip, user_agent FROM sessions WHERE expires_at > ? ORDER BY last_seen_at DESC`, s.now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	current := strings.ToUpper(hex.EncodeToString(hashToken(currentToken)))
+	var out []SessionInfo
+	for rows.Next() {
+		var hash string
+		var created, seen, expires int64
+		var info SessionInfo
+		if err := rows.Scan(&hash, &created, &seen, &expires, &info.Remember, &info.IP, &info.UserAgent); err != nil {
+			return nil, err
+		}
+		info.ID = strings.ToLower(hash[:sessionIDLength])
+		info.CreatedAt, info.LastSeenAt, info.ExpiresAt = time.Unix(created, 0), time.Unix(seen, 0), time.Unix(expires, 0)
+		info.Current = hash == current
+		out = append(out, info)
+	}
+	return out, rows.Err()
+}
+
+// RevokeSession signs one browser out.
+func (s *Service) RevokeSession(ctx context.Context, id string) error {
+	if len(id) != sessionIDLength || strings.Trim(id, "0123456789abcdef") != "" {
+		return ErrSessionNotFound
+	}
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM sessions WHERE lower(substr(hex(token_hash), 1, ?)) = ?`, sessionIDLength, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
+// RevokeOtherSessions signs out every browser but the one that asked, and
+// reports how many that was.
+func (s *Service) RevokeOtherSessions(ctx context.Context, keepToken string) (int, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash != ?`, hashToken(keepToken))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
 }
 
 // ResetPassword is the recovery path, reachable only from the panel's own

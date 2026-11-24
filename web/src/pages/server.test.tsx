@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import '@/i18n'
 import type { Server } from '@/lib/api'
-import { DeleteDialog } from '@/pages/server'
+import { DeleteDialog } from '@/pages/server-delete'
 
 vi.mock('@tanstack/react-router', () => ({
   useNavigate: () => vi.fn(),

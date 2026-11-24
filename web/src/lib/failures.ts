@@ -48,3 +48,45 @@ export function aftermath(details: Record<string, unknown> | null | undefined): 
   }
   return details?.restored === false ? 'notRestored' : 'unknown'
 }
+
+/** Names the translator reads as its own instructions, not as values. */
+const TRANSLATOR_OPTIONS = new Set([
+  'count',
+  'context',
+  'defaultValue',
+  'lng',
+  'lngs',
+  'ns',
+  'replace',
+  'returnObjects',
+  'returnDetails',
+  'joinArrays',
+  'postProcess',
+  'interpolation',
+  'ordinal',
+  'keySeparator',
+  'nsSeparator',
+  'fallbackLng',
+  'skipInterpolation',
+])
+
+/**
+ * A failure's details as values for a sentence of the catalogue.
+ *
+ * The details come from the panel's backend, and some of them from a server's
+ * own output. Handed to the translator as they are, a detail that happened to
+ * be called "count" or "defaultValue" would change which sentence is shown
+ * instead of filling a blank in it. Only plain values under ordinary names go
+ * through.
+ */
+export function failureValues(
+  details: Record<string, unknown> | null | undefined,
+): Record<string, string | number> {
+  const values: Record<string, string | number> = {}
+  for (const [key, value] of Object.entries(details ?? {})) {
+    if (!TRANSLATOR_OPTIONS.has(key) && (typeof value === 'string' || typeof value === 'number')) {
+      values[key] = value
+    }
+  }
+  return values
+}

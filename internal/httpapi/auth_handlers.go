@@ -199,17 +199,26 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := map[string]any{
-		"username":      profile.Username,
-		"totp_enabled":  profile.TOTPEnabled,
-		"totp_pending":  profile.TOTPPending,
-		"panel_url":     profile.PanelURL,
-		"version":       s.version,
-		"last_login_at": nil,
-		"last_login_ip": nil,
+		"username":     profile.Username,
+		"totp_enabled": profile.TOTPEnabled,
+		"totp_pending": profile.TOTPPending,
+		"panel_url":    profile.PanelURL,
+		"version":      s.version,
+		// The panel's clock, for the places that go by it.
+		"timezone":           time.Local.String(),
+		"utc_offset_minutes": utcOffsetMinutes(time.Now()),
+		"last_login_at":      nil,
+		"last_login_ip":      nil,
 	}
 	if !profile.LastLoginAt.IsZero() {
 		resp["last_login_at"] = profile.LastLoginAt.Unix()
 		resp["last_login_ip"] = profile.LastLoginIP
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// utcOffsetMinutes is how far the panel's clock is from UTC at t.
+func utcOffsetMinutes(t time.Time) int {
+	_, seconds := t.Local().Zone()
+	return seconds / 60
 }

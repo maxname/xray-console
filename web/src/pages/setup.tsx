@@ -1,10 +1,10 @@
 import { useMutation } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { QRCodeSVG } from 'qrcode.react'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { AuthLayout, Field, Notice } from '@/components/auth-layout'
+import { TotpKey } from '@/components/totp-key'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -242,25 +242,7 @@ function TotpStep({
 
   return (
     <form className="flex flex-col gap-5" onSubmit={handleSubmit}>
-      {/* White behind the code in both themes: scanners want dark-on-light,
-          and a QR drawn in the dark theme's colours reads badly or not at all. */}
-      <div className="self-center rounded-lg bg-white p-3">
-        <QRCodeSVG
-          value={enrollment.url}
-          size={176}
-          role="img"
-          aria-label={t('setup.totpStep.qrLabel')}
-        />
-      </div>
-      <Field>
-        <span className="font-medium">{t('setup.totpStep.secret')}</span>
-        <code
-          className="rounded-lg bg-muted px-2.5 py-1.5 font-mono text-[13px] break-all select-all"
-          translate="no"
-        >
-          {enrollment.secret.replace(/(.{4})(?=.)/g, '$1 ')}
-        </code>
-      </Field>
+      <TotpKey enrollment={enrollment} />
       <Field>
         <Label htmlFor="setup-totp-code">{t('setup.totpStep.code')}</Label>
         <Input

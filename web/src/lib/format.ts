@@ -70,3 +70,16 @@ export function formatBytes(bytes: number): string {
   const number = new Intl.NumberFormat(i18n.language, { maximumFractionDigits: digits }).format(value)
   return `${number}\u00a0${i18n.t(`units.${BYTE_UNITS[unit]}`)}`
 }
+
+/**
+ * The panel's clock as a person reads it: "Europe/Moscow, UTC+3", or only the
+ * offset when the panel goes by its machine's own zone, which has no name
+ * worth showing.
+ */
+export function formatPanelClock(timezone: string, offsetMinutes: number): string {
+  const sign = offsetMinutes < 0 ? '−' : '+'
+  const hours = Math.floor(Math.abs(offsetMinutes) / 60)
+  const minutes = Math.abs(offsetMinutes) % 60
+  const offset = `UTC${sign}${hours}${minutes === 0 ? '' : `:${String(minutes).padStart(2, '0')}`}`
+  return timezone === '' || timezone === 'Local' ? offset : `${timezone}, ${offset}`
+}

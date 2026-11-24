@@ -459,3 +459,87 @@ func TestSudoRefusingIsToldFromACommandThatMentionsSudo(t *testing.T) {
 		t.Fatalf("a lost connection: %v", err)
 	}
 }
+
+// socksProxy is a SOCKS5 server for one connection that asks for this user
+// and password, or for none when user is empty, and then says "connected".
+func socksProxy(t *testing.T, user, password string) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+	go func() {
+		defer server.Close()
+		head := make([]byte, 2)
+		if _, err := io.ReadFull(server, head); err != nil {
+			return
+		}
+		offered := make([]byte, head[1])
+		if _, err := io.ReadFull(server, offered); err != nil {
+			return
+		}
+		wanted := byte(0)
+		if user != "" {
+			wanted = 2
+		}
+		if !bytes.Contains(offered, []byte{wanted}) {
+			_, _ = server.Write([]byte{5, 0xff})
+			return
+		}
+		_, _ = server.Write([]byte{5, wanted})
+		if wanted == 2 {
+			field := func() string {
+				length := make([]byte, 1)
+				if _, err := io.ReadFull(server, length); err != nil {
+					return ""
+				}
+				value := make([]byte, length[0])
+				_, _ = io.ReadFull(server, value)
+				return string(value)
+			}
+			version := make([]byte, 1)
+			if _, err := io.ReadFull(server, version); err != nil {
+				return
+			}
+			if field() != user || field() != password {
+				_, _ = server.Write([]byte{1, 1})
+				return
+			}
+			_, _ = server.Write([]byte{1, 0})
+		}
+		request := make([]byte, 5)
+		if _, err := io.ReadFull(server, request); err != nil {
+			return
+		}
+		rest := make([]byte, int(request[4])+2)
+		if _, err := io.ReadFull(server, rest); err != nil {
+			return
+		}
+		_, _ = server.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	}()
+	return client
+}
+
+func TestSOCKSConnectSignsInWhenTheProxyAsks(t *testing.T) {
+	right := &SOCKSAuth{User: "xray", Password: "s3cret-of-the-device"}
+
+	if err := socksConnect(socksProxy(t, "", ""), "example.com", 443, nil); err != nil {
+		t.Fatalf("an open proxy: %v", err)
+	}
+	// Credentials on offer are not forced on a proxy that asks for none.
+	if err := socksConnect(socksProxy(t, "", ""), "example.com", 443, right); err != nil {
+		t.Fatalf("an open proxy, with credentials to give: %v", err)
+	}
+	if err := socksConnect(socksProxy(t, right.User, right.Password), "example.com", 443, right); err != nil {
+		t.Fatalf("a proxy that asks, given the right answer: %v", err)
+	}
+	wrong := &SOCKSAuth{User: "xray", Password: "guess"}
+	if err := socksConnect(socksProxy(t, right.User, right.Password), "example.com", 443, wrong); err == nil ||
+		!strings.Contains(err.Error(), "refused the user and password") {
+		t.Fatalf("a wrong password: %v", err)
+	}
+	if err := socksConnect(socksProxy(t, right.User, right.Password), "example.com", 443, nil); err == nil {
+		t.Fatal("a proxy that asks for a password let through a request without one")
+	}
+	if err := socksConnect(socksProxy(t, "", ""), strings.Repeat("a", 256), 443, nil); err == nil {
+		t.Fatal("a host name that does not fit in the request was sent anyway")
+	}
+}

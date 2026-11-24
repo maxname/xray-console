@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -468,5 +469,156 @@ func TestFailuresAreCountedAcrossAnIPv6Network(t *testing.T) {
 	// The network next door is somebody else.
 	if err := attempt("2001:db8:1:3::1", goodPassword); err != nil {
 		t.Fatalf("another network: %v", err)
+	}
+}
+
+const nextPassword = "a different battery staple"
+
+func TestChangingThePasswordNeedsTheOldOneAndSignsOtherBrowsersOut(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.setup(t, false)
+	here, err := f.CreateSession(ctx, "203.0.113.80", "this browser", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere, err := f.CreateSession(ctx, "198.51.100.7", "another browser", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.ChangePassword(ctx, "not the password!", nextPassword, here.Token); !errors.Is(err, ErrWrongPassword) {
+		t.Fatalf("wrong current password: %v", err)
+	}
+	if err := f.ChangePassword(ctx, goodPassword, "short", here.Token); !errors.Is(err, ErrPasswordTooShort) {
+		t.Fatalf("a password too short: %v", err)
+	}
+	// Nothing changed yet, nobody was signed out.
+	if ok, _ := f.Authenticate(ctx, elsewhere.Token); !ok {
+		t.Fatal("a refused change signed a browser out")
+	}
+
+	if err := f.ChangePassword(ctx, goodPassword, nextPassword, here.Token); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := f.Authenticate(ctx, here.Token); !ok {
+		t.Fatal("the browser that changed the password was signed out")
+	}
+	// Whoever else held a session got it with the old password.
+	if ok, _ := f.Authenticate(ctx, elsewhere.Token); ok {
+		t.Fatal("another browser is still signed in after the password changed")
+	}
+	var invalid *InvalidCredentialsError
+	if _, err := f.login(goodPassword, ""); !errors.As(err, &invalid) {
+		t.Fatalf("the old password: %v", err)
+	}
+	if _, err := f.login(nextPassword, ""); err != nil {
+		t.Fatalf("the new password: %v", err)
+	}
+}
+
+func TestTwoFactorSignInIsTurnedOnAndOffFromTheAccount(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.setup(t, false)
+
+	if _, err := f.BeginTOTP(ctx, "not the password!"); !errors.Is(err, ErrWrongPassword) {
+		t.Fatalf("a secret asked for with the wrong password: %v", err)
+	}
+	if err := f.DisableTOTP(ctx, goodPassword, ""); !errors.Is(err, ErrTOTPOff) {
+		t.Fatalf("turning off what is not on: %v", err)
+	}
+	enrollment, err := f.BeginTOTP(ctx, goodPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := base32NoPad.DecodeString(enrollment.Secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeNow := func() string { return totpCode(secret, uint64(f.clock.Unix())/totpPeriod) }
+
+	// Issued and not yet confirmed: the password alone still signs in.
+	if _, err := f.login(goodPassword, ""); err != nil {
+		t.Fatalf("before the code was confirmed: %v", err)
+	}
+	if err := f.ConfirmTOTP(ctx, codeNow()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.login(goodPassword, ""); !errors.Is(err, ErrTOTPRequired) {
+		t.Fatalf("after turning it on, without a code: %v", err)
+	}
+	if _, err := f.BeginTOTP(ctx, goodPassword); !errors.Is(err, ErrTOTPAlreadyOn) {
+		t.Fatalf("a second secret while one is in use: %v", err)
+	}
+
+	// Off takes both the password and a code: it is what an intruder with a
+	// stolen session would do first.
+	f.clock = f.clock.Add(totpPeriod * time.Second)
+	if err := f.DisableTOTP(ctx, "not the password!", codeNow()); !errors.Is(err, ErrWrongPassword) {
+		t.Fatalf("off with the wrong password: %v", err)
+	}
+	if err := f.DisableTOTP(ctx, goodPassword, "000000"); !errors.Is(err, ErrTOTPInvalid) {
+		t.Fatalf("off with a wrong code: %v", err)
+	}
+	if err := f.DisableTOTP(ctx, goodPassword, codeNow()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.login(goodPassword, ""); err != nil {
+		t.Fatalf("after turning it off: %v", err)
+	}
+}
+
+func TestSessionsAreListedAndEndedOneByOneOrAllButThisOne(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.setup(t, false)
+	here, _ := f.CreateSession(ctx, "203.0.113.80", "this browser", false)
+	f.clock = f.clock.Add(time.Minute)
+	phone, _ := f.CreateSession(ctx, "198.51.100.7", "phone", true)
+	f.clock = f.clock.Add(time.Minute)
+	old, _ := f.CreateSession(ctx, "198.51.100.9", "old laptop", false)
+
+	list, err := f.Sessions(ctx, here.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("%d sessions listed, want 3", len(list))
+	}
+	byAgent := map[string]SessionInfo{}
+	for _, session := range list {
+		byAgent[session.UserAgent] = session
+		// The id names a session; it is not a way into one.
+		if len(session.ID) != sessionIDLength || strings.Contains(here.Token+phone.Token+old.Token, session.ID) {
+			t.Fatalf("session id %q", session.ID)
+		}
+	}
+	if !byAgent["this browser"].Current || byAgent["phone"].Current || !byAgent["phone"].Remember {
+		t.Fatalf("sessions: %+v", list)
+	}
+
+	if err := f.RevokeSession(ctx, byAgent["phone"].ID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := f.Authenticate(ctx, phone.Token); ok {
+		t.Fatal("an ended session still signs in")
+	}
+	if err := f.RevokeSession(ctx, byAgent["phone"].ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("ending a session twice: %v", err)
+	}
+	if err := f.RevokeSession(ctx, "%"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("something that is not an id: %v", err)
+	}
+
+	ended, err := f.RevokeOtherSessions(ctx, here.Token)
+	if err != nil || ended != 1 {
+		t.Fatalf("ended %d other sessions, %v; want 1", ended, err)
+	}
+	if ok, _ := f.Authenticate(ctx, old.Token); ok {
+		t.Fatal("another session survived \"sign out everywhere else\"")
+	}
+	if ok, _ := f.Authenticate(ctx, here.Token); !ok {
+		t.Fatal("this session was ended with the others")
 	}
 }

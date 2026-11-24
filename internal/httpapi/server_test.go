@@ -501,3 +501,60 @@ func TestSettingsOfAServerWithoutXrayAreRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestTheAccountIsManagedThroughTheAPI(t *testing.T) {
+	h := newHarness(t)
+	h.setup()
+
+	list := h.do("GET", "/api/auth/sessions", nil)
+	sessions, _ := list.body["sessions"].([]any)
+	if list.status != http.StatusOK || len(sessions) != 1 || sessions[0].(map[string]any)["current"] != true {
+		t.Fatalf("sessions: %d %s", list.status, list.raw)
+	}
+
+	wrong := h.do("POST", "/api/auth/password", map[string]any{"current_password": "not the password!", "new_password": "another good password"})
+	if wrong.status != http.StatusForbidden || wrong.errorCode() != "wrong_password" {
+		t.Fatalf("wrong current password: %d %s", wrong.status, wrong.raw)
+	}
+	short := h.do("POST", "/api/auth/password", map[string]any{"current_password": testPassword, "new_password": "short"})
+	if short.status != http.StatusUnprocessableEntity || short.errorCode() != "password_too_short" {
+		t.Fatalf("a short password: %d %s", short.status, short.raw)
+	}
+	changed := h.do("POST", "/api/auth/password", map[string]any{"current_password": testPassword, "new_password": "another good password"})
+	if changed.status != http.StatusOK {
+		t.Fatalf("change: %d %s", changed.status, changed.raw)
+	}
+	// The browser that changed it stays signed in.
+	if me := h.do("GET", "/api/me", nil); me.status != http.StatusOK {
+		t.Fatalf("after the change: %d %s", me.status, me.raw)
+	}
+
+	begun := h.do("POST", "/api/auth/totp", map[string]any{"password": "another good password"})
+	if begun.status != http.StatusOK || begun.body["secret"] == "" || begun.body["url"] == nil {
+		t.Fatalf("a two-factor secret: %d %s", begun.status, begun.raw)
+	}
+	if me := h.do("GET", "/api/me", nil); me.body["totp_pending"] != true || me.body["totp_enabled"] != false {
+		t.Fatalf("a secret issued and not confirmed: %s", me.raw)
+	}
+	// Dropped without a code, since it was never in use.
+	if off := h.do("POST", "/api/auth/totp/disable", map[string]any{"password": "another good password"}); off.status != http.StatusOK {
+		t.Fatalf("dropping an unconfirmed secret: %d %s", off.status, off.raw)
+	}
+
+	if ended := h.do("POST", "/api/auth/sessions/revoke-others", nil); ended.status != http.StatusOK || ended.body["ended"] != float64(0) {
+		t.Fatalf("ending other sessions: %d %s", ended.status, ended.raw)
+	}
+	if missing := h.do("DELETE", "/api/auth/sessions/0123456789abcdef", nil); missing.status != http.StatusNotFound {
+		t.Fatalf("ending a session that is not there: %d %s", missing.status, missing.raw)
+	}
+
+	h.do("POST", "/api/auth/logout", nil)
+	for _, call := range [][2]string{
+		{"POST", "/api/auth/password"}, {"POST", "/api/auth/totp"}, {"POST", "/api/auth/totp/disable"},
+		{"GET", "/api/auth/sessions"}, {"POST", "/api/auth/sessions/revoke-others"},
+	} {
+		if got := h.do(call[0], call[1], map[string]any{}); got.status != http.StatusUnauthorized {
+			t.Errorf("%s %s without a session: %d", call[0], call[1], got.status)
+		}
+	}
+}

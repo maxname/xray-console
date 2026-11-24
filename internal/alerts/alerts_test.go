@@ -625,3 +625,27 @@ func TestAWebhookIsNotFollowedElsewhereAndItsAnswerIsNotQuoted(t *testing.T) {
 		t.Fatalf("the answer's own words came back: %v", err)
 	}
 }
+
+func TestQuietHoursGoByThePanelsClock(t *testing.T) {
+	saved := time.Local
+	defer func() { time.Local = saved }()
+	moscow, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		t.Skip("no zone database on this machine")
+	}
+	// Half past eleven in the evening in Moscow, half past eight in UTC.
+	at := time.Date(2026, 11, 24, 20, 30, 0, 0, time.UTC)
+
+	time.Local = moscow
+	if !quiet(at) {
+		t.Fatal("23:30 by the panel's clock is not a quiet hour")
+	}
+	if got := clock(at); got != "23:30" {
+		t.Fatalf("the time in a message is %s, want 23:30", got)
+	}
+	// The same moment on a panel left on UTC: the evening has hours to go.
+	time.Local = time.UTC
+	if quiet(at) {
+		t.Fatal("20:30 by the panel's clock is a quiet hour")
+	}
+}

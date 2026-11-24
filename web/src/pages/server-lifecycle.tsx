@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
+import { FailureExplained } from '@/components/failure-explained'
 import { Page, PageHeader, Panel } from '@/components/page'
 import { Button } from '@/components/ui/button'
 import {
@@ -29,45 +30,23 @@ import { aftermath, explained } from '@/lib/failures'
 import { toast } from '@/lib/toast'
 import { releaseKey, useRelease } from '@/lib/use-release'
 import { cn } from '@/lib/utils'
-import {
-  Breadcrumb,
-  ChangeList,
-  DeleteDialog,
-  LogView,
-  StepList,
-} from '@/pages/server'
+import { Breadcrumb, ChangeList } from '@/components/server-parts'
+import { DeleteDialog } from '@/pages/server-delete'
+import { LogView, StepList } from '@/components/operation-view'
 
 /** What a failed job says went wrong, in the words the installation uses. */
 function FailureText({ operation }: { operation: Operation }) {
-  const { t } = useTranslation()
   const failure = operation.error
   if (failure === null) {
     return null
   }
-  const details = failure.details ?? {}
   const code = explained(failure.code)
-  const output = typeof details.output === 'string' ? details.output : ''
   return (
-    <>
-      <div className="flex flex-col gap-1">
-        <p className="font-semibold">{t(`server.errors.${code}.title`, details)}</p>
-        <p>{t(`server.errors.${code}.text`, details)}</p>
-        {(code === 'internal' || code === 'ssh_unreachable') && failure.message !== '' && (
-          <code className="font-mono text-xs break-all text-muted-foreground" translate="no">
-            {failure.message}
-          </code>
-        )}
-      </div>
-      {output !== '' && (
-        <pre
-          className="max-h-60 overflow-auto rounded-lg bg-muted p-3 font-mono text-xs whitespace-pre-wrap"
-          translate="no"
-          tabIndex={0}
-        >
-          {output}
-        </pre>
-      )}
-    </>
+    <FailureExplained
+      failure={failure}
+      prefix={`server.errors.${code}`}
+      tellMessage={code === 'internal' || code === 'ssh_unreachable'}
+    />
   )
 }
 

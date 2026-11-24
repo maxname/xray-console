@@ -121,6 +121,12 @@ const statsRoute = createRoute({
   component: lazyRouteComponent(() => import('@/pages/stats'), 'StatsPage'),
 })
 
+const securityRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: '/security',
+  component: lazyRouteComponent(() => import('@/pages/security'), 'SecurityPage'),
+})
+
 const routeTree = rootRoute.addChildren([
   setupRoute,
   loginRoute,
@@ -134,6 +140,7 @@ const routeTree = rootRoute.addChildren([
     routingRoute,
     clientsRoute,
     statsRoute,
+    securityRoute,
   ]),
 ])
 
