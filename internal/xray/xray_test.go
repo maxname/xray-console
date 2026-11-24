@@ -2,6 +2,7 @@ package xray
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -303,5 +304,52 @@ func TestAnInboundThatLostItsListsIsReadWithoutPanicking(t *testing.T) {
 	}
 	if in.MaskHost() != "" {
 		t.Fatalf("mask host %q", in.MaskHost())
+	}
+}
+
+func TestAServerCanMasqueradeAsItsOwnDomain(t *testing.T) {
+	inbound, err := NewDomainInbound("https://CDN.Example.net/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Strangers go to the stub site on the server itself, under its own name.
+	if inbound.Domain != "cdn.example.net" || inbound.Dest != StubListen || inbound.MaskHost() != "cdn.example.net" {
+		t.Fatalf("inbound: %+v", inbound)
+	}
+	if inbound.PrivateKey == "" || len(inbound.ShortIDs) != 2 || inbound.CheckUUID == "" {
+		t.Fatalf("a server with a domain was made without keys: %+v", inbound)
+	}
+	server, err := inbound.ServerConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"dest": "127.0.0.1:8443"`, `"cdn.example.net"`} {
+		if !strings.Contains(string(server), want) {
+			t.Errorf("server config lacks %s", want)
+		}
+	}
+	if copied := inbound.Clone(); copied.Domain != inbound.Domain {
+		t.Fatal("a copy lost the domain")
+	}
+
+	// Someone else's site instead: nothing of the domain stays behind.
+	if err := inbound.SetMaskHost("www.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if inbound.Domain != "" || inbound.Dest != "www.example.com:443" {
+		t.Fatalf("after going back to someone else's site: %+v", inbound)
+	}
+	// A certificate cannot be issued for an address, a name is never a
+	// command, and a bad one costs no keys.
+	for _, bad := range []string{"192.0.2.10", "localhost", "", "cdn.example.net;reboot", "cdn.example.net $(id)"} {
+		if err := inbound.SetDomain(bad); !errors.Is(err, ErrInvalidDomain) {
+			t.Errorf("SetDomain(%q): %v", bad, err)
+		}
+		if _, err := NewDomainInbound(bad); !errors.Is(err, ErrInvalidDomain) {
+			t.Errorf("NewDomainInbound(%q): %v", bad, err)
+		}
+	}
+	if inbound.Dest != "www.example.com:443" {
+		t.Fatal("a refused domain changed the inbound")
 	}
 }

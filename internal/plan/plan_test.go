@@ -138,3 +138,46 @@ func TestDiff(t *testing.T) {
 		t.Fatalf("distant changes should be separated by one gap, got %d: %v", gaps, far)
 	}
 }
+
+func TestADomainOfItsOwnIsAChangeAndItsAbsenceIsNot(t *testing.T) {
+	srv, tpl := fixture(t)
+	first, _ := Build(srv, tpl, nil)
+	srv.Applied = first.Snapshot(srv, time.Unix(1_800_000_000, 0))
+
+	// A snapshot from before servers could have a domain says nothing about
+	// one, which reads as "none": such a server has no change waiting.
+	delete(srv.Applied.Fields, FieldDomain)
+	if got := first.Changed(srv.Applied); len(got) != 0 {
+		t.Fatalf("a server applied before domains existed shows changes: %v", got)
+	}
+
+	// The same name, but now answered by a stub site on the server: the name
+	// REALITY borrows has not changed, where it borrows it from has.
+	if err := srv.Inbound.SetDomain("www.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := Build(srv, tpl, nil)
+	if got := strings.Join(second.Changed(srv.Applied), " "); got != FieldDomain {
+		t.Fatalf("changed %q, want %q", got, FieldDomain)
+	}
+	if !strings.Contains(string(second.Config), `"dest": "`+xray.StubListen+`"`) {
+		t.Fatal("the configuration does not send strangers to the stub site")
+	}
+	// What the server runs is kept apart from what it should run.
+	running, err := RunningInbound(srv.Applied)
+	if err != nil || running.Domain != "" || running.Dest != "www.example.com:443" {
+		t.Fatalf("running inbound: %+v %v", running, err)
+	}
+
+	srv.Applied = second.Snapshot(srv, time.Unix(1_800_000_100, 0))
+	if err := srv.Inbound.SetDomain("cdn.example.net"); err != nil {
+		t.Fatal(err)
+	}
+	third, _ := Build(srv, tpl, nil)
+	if got := strings.Join(third.Changed(srv.Applied), " "); got != FieldMaskHost+" "+FieldDomain {
+		t.Fatalf("another domain changed %q", got)
+	}
+	if running, _ := RunningInbound(srv.Applied); running.Domain != "www.example.com" {
+		t.Fatalf("the running domain: %q", running.Domain)
+	}
+}

@@ -61,6 +61,23 @@ func textUpdate(version string, servers []string) string {
 	return fmt.Sprintf("Вышел Xray %s. На прежней версии: %s.", version, strings.Join(servers, ", "))
 }
 
+// textCert says a certificate was not renewed: how long it still has, or that
+// it has run out.
+func textCert(server, domain string, notAfter, now time.Time) string {
+	left := notAfter.Sub(now)
+	if left <= 0 {
+		return fmt.Sprintf("Сертификат %s на сервере %s истёк %s и не продлён. Посетители домена видят предупреждение браузера.",
+			domain, server, notAfter.Local().Format("02.01.2006"))
+	}
+	days := int64(left / (24 * time.Hour))
+	if days < 1 {
+		return fmt.Sprintf("Сертификат %s на сервере %s истекает сегодня и не продлён.", domain, server)
+	}
+	return fmt.Sprintf("Сертификат %s на сервере %s не продлён: действует до %s, %s %d %s.",
+		domain, server, notAfter.Local().Format("02.01.2006"),
+		plural(days, "остался", "осталось", "осталось"), days, plural(days, "день", "дня", "дней"))
+}
+
 const textTest = "Проверочное сообщение Xray Console: оповещения настроены."
 
 // digest joins several messages into one, each with the time it is about.

@@ -185,6 +185,7 @@ type alertsJSON struct {
 	OnDown           bool   `json:"on_down"`
 	OnUp             bool   `json:"on_up"`
 	OnUpdate         bool   `json:"on_update"`
+	OnCert           bool   `json:"on_cert"`
 	DownAfterMinutes int    `json:"down_after_minutes"`
 	RepeatHours      int    `json:"repeat_hours"`
 	QuietHours       bool   `json:"quiet_hours"`
@@ -194,7 +195,7 @@ func alertsView(settings alerts.Settings) alertsJSON {
 	return alertsJSON{
 		Enabled: settings.Enabled, TelegramTokenSet: settings.TelegramToken != "",
 		TelegramChat: settings.TelegramChat, WebhookURL: settings.WebhookURL,
-		OnDown: settings.OnDown, OnUp: settings.OnUp, OnUpdate: settings.OnUpdate,
+		OnDown: settings.OnDown, OnUp: settings.OnUp, OnUpdate: settings.OnUpdate, OnCert: settings.OnCert,
 		DownAfterMinutes: settings.DownAfterMinutes, RepeatHours: settings.RepeatHours,
 		QuietHours: settings.QuietHours,
 	}
@@ -212,15 +213,17 @@ func (s *Server) handleGetAlerts(w http.ResponseWriter, r *http.Request) {
 type alertsRequest struct {
 	Enabled bool `json:"enabled"`
 	// TelegramToken is null to keep the saved token, "" to remove it.
-	TelegramToken    *string `json:"telegram_token"`
-	TelegramChat     string  `json:"telegram_chat"`
-	WebhookURL       string  `json:"webhook_url"`
-	OnDown           bool    `json:"on_down"`
-	OnUp             bool    `json:"on_up"`
-	OnUpdate         bool    `json:"on_update"`
-	DownAfterMinutes int     `json:"down_after_minutes"`
-	RepeatHours      int     `json:"repeat_hours"`
-	QuietHours       bool    `json:"quiet_hours"`
+	TelegramToken *string `json:"telegram_token"`
+	TelegramChat  string  `json:"telegram_chat"`
+	WebhookURL    string  `json:"webhook_url"`
+	OnDown        bool    `json:"on_down"`
+	OnUp          bool    `json:"on_up"`
+	OnUpdate      bool    `json:"on_update"`
+	// OnCert is null to leave the switch as it is.
+	OnCert           *bool `json:"on_cert"`
+	DownAfterMinutes int   `json:"down_after_minutes"`
+	RepeatHours      int   `json:"repeat_hours"`
+	QuietHours       bool  `json:"quiet_hours"`
 }
 
 func (s *Server) handleUpdateAlerts(w http.ResponseWriter, r *http.Request) {
@@ -236,12 +239,15 @@ func (s *Server) handleUpdateAlerts(w http.ResponseWriter, r *http.Request) {
 	settings := alerts.Settings{
 		Enabled: req.Enabled, TelegramToken: current.TelegramToken,
 		TelegramChat: req.TelegramChat, WebhookURL: req.WebhookURL,
-		OnDown: req.OnDown, OnUp: req.OnUp, OnUpdate: req.OnUpdate,
+		OnDown: req.OnDown, OnUp: req.OnUp, OnUpdate: req.OnUpdate, OnCert: current.OnCert,
 		DownAfterMinutes: req.DownAfterMinutes, RepeatHours: req.RepeatHours,
 		QuietHours: req.QuietHours,
 	}
 	if req.TelegramToken != nil {
 		settings.TelegramToken = *req.TelegramToken
+	}
+	if req.OnCert != nil {
+		settings.OnCert = *req.OnCert
 	}
 	if err := settings.Validate(); err != nil {
 		var fieldErr *alerts.FieldError

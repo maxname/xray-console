@@ -81,6 +81,7 @@ export function AlertsForm({ settings, onClose }: { settings: AlertSettings; onC
     on_down: form.on_down,
     on_up: form.on_up,
     on_update: form.on_update,
+    on_cert: form.on_cert,
     down_after_minutes: form.down_after_minutes,
     repeat_hours: form.repeat_hours,
     quiet_hours: form.quiet_hours,
@@ -189,6 +190,7 @@ export function AlertsForm({ settings, onClose }: { settings: AlertSettings; onC
             ['on_down', 'down'],
             ['on_up', 'up'],
             ['on_update', 'update'],
+            ['on_cert', 'cert'],
           ] as const
         ).map(([key, label]) => (
           <label key={key} className="inline-flex cursor-pointer items-center gap-2">

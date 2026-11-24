@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"xray-console/internal/certs"
 	"xray-console/internal/probe"
 	"xray-console/internal/secrets"
 	"xray-console/internal/servers"
@@ -29,6 +30,7 @@ type fixture struct {
 	notifier *Notifier
 	store    *Store
 	servers  *servers.Store
+	certs    *certs.Store
 	now      time.Time
 	states   map[int64]*probe.State
 
@@ -54,7 +56,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{
-		t: t, store: NewStore(db, box), servers: servers.NewStore(db, box),
+		t: t, store: NewStore(db, box), servers: servers.NewStore(db, box), certs: certs.NewStore(db),
 		// Noon: well outside the quiet hours.
 		now:    time.Date(2026, 11, 23, 12, 0, 0, 0, time.Local),
 		states: map[int64]*probe.State{},
@@ -90,6 +92,7 @@ func newFixture(t *testing.T) *fixture {
 			return f.latest, nil
 		},
 		Outdated: func(context.Context, string) ([]*servers.Server, error) { return f.behind, nil },
+		Certs:    f.certs,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		now:      func() time.Time { return f.now },
 	}
@@ -497,6 +500,80 @@ func TestANewReleaseIsAnnouncedOnce(t *testing.T) {
 	f.after(time.Hour)
 	if got := f.texts(); len(got) != 1 || !strings.Contains(got[0], "v26.12.1") {
 		t.Fatalf("the next release: %v", got)
+	}
+}
+
+// shows records the certificate a server shows: issued this long ago, with
+// this long left.
+func (f *fixture) shows(srv *servers.Server, age, left time.Duration) {
+	f.t.Helper()
+	err := f.certs.Record(context.Background(), certs.State{
+		ServerID: srv.ID, Domain: "cdn.example.net", CheckedAt: f.now,
+		NotBefore: f.now.Add(-age), NotAfter: f.now.Add(left),
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestACertificateThatWasNotRenewedIsToldOnce(t *testing.T) {
+	f := newFixture(t)
+	srv := f.server("ams-1")
+	day := 24 * time.Hour
+
+	// Renewed on time, as it normally is: nothing to say.
+	f.shows(srv, 30*day, 60*day)
+	f.after(time.Minute)
+	if got := f.texts(); len(got) != 0 {
+		t.Fatalf("a certificate with two months left was reported: %q", got)
+	}
+
+	// The server's own renewal has not happened and the end is near.
+	f.shows(srv, 78*day, 12*day)
+	f.after(time.Minute)
+	texts := f.texts()
+	if len(texts) != 1 || !strings.Contains(texts[0], "cdn.example.net") || !strings.Contains(texts[0], "ams-1") ||
+		!strings.Contains(texts[0], "не продлён") || !strings.Contains(texts[0], "осталось 11 дней") {
+		t.Fatalf("texts: %q", texts)
+	}
+	hooks := f.hooks()
+	if len(hooks) != 1 || hooks[0]["event"] != KindCertNotRenewed || hooks[0]["server"] != "ams-1" {
+		t.Fatalf("webhook: %v", hooks)
+	}
+	if data, _ := hooks[0]["data"].(map[string]any); data["domain"] != "cdn.example.net" || data["days_left"] != float64(11) {
+		t.Fatalf("webhook data: %v", hooks[0]["data"])
+	}
+	// Once: the same certificate is not news the next minute, or the next day.
+	f.after(time.Minute)
+	f.after(26 * time.Hour)
+	if got := f.texts(); len(got) != 0 {
+		t.Fatalf("the same certificate was reported again: %q", got)
+	}
+
+	// Renewed at last, and the one after it runs late again: that is news.
+	f.shows(srv, day, 89*day)
+	f.after(time.Minute)
+	f.shows(srv, 85*day, 5*day)
+	f.after(time.Minute)
+	if got := f.texts(); len(got) != 1 || !strings.Contains(got[0], "осталось 4 дня") {
+		t.Fatalf("the next certificate running late: %q", got)
+	}
+
+	// One that has run out says so.
+	f.shows(srv, 91*day, -day)
+	f.after(time.Minute)
+	if got := f.texts(); len(got) != 1 || !strings.Contains(got[0], "истёк") {
+		t.Fatalf("a certificate that has run out: %q", got)
+	}
+
+	// The switch is a switch.
+	settings := f.settings()
+	settings.OnCert = false
+	f.save(settings)
+	f.shows(srv, 80*day, 10*day)
+	f.after(time.Minute)
+	if got := f.texts(); len(got) != 0 {
+		t.Fatalf("reported with the switch off: %q", got)
 	}
 }
 

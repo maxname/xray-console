@@ -1,5 +1,6 @@
 // Package install puts Xray on a server: eight resumable, undoable steps from
-// "sign in over SSH" to "a request went through the new inbound".
+// "sign in over SSH" to "a request went through the new inbound" — nine for a
+// server that masquerades as its own domain, which gets a stub site as well.
 package install
 
 import (
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"xray-console/internal/acmesh"
 	"xray-console/internal/events"
 	"xray-console/internal/ops"
 	"xray-console/internal/plan"
@@ -38,8 +40,16 @@ const (
 	StepCheck    = "check"
 )
 
-var stepOrder = []string{
-	StepSSH, StepSystem, StepXray, StepKeys, StepConfig, StepService, StepFirewall, StepCheck,
+// installOrder is the steps of an installation: with the stub site, for a
+// server that masquerades as its own domain, or without.
+func installOrder(ownDomain bool) []string {
+	order := []string{StepSSH, StepSystem, StepXray, StepKeys, StepConfig, StepService, StepFirewall}
+	if ownDomain {
+		// After the firewall, before the check: REALITY borrows the stub's
+		// handshake for every connection, the check's included.
+		order = append(order, StepSite)
+	}
+	return append(order, StepCheck)
 }
 
 // Failure codes specific to installing. The UI has a paragraph for each.
@@ -77,8 +87,13 @@ type Params struct {
 	Auth string `json:"auth"`
 	// DisablePasswordLogin turns PasswordAuthentication off once the key works.
 	DisablePasswordLogin bool `json:"disable_password_login"`
-	// MaskHost is the site REALITY passes itself off as.
+	// MaskHost is the site REALITY passes itself off as, when that is someone
+	// else's site.
 	MaskHost string `json:"mask_host"`
+	// Domain is the server's own domain, when it masquerades as itself: the
+	// installation then sets up a stub site and a certificate for it. One of
+	// MaskHost and Domain is set.
+	Domain string `json:"domain,omitempty"`
 	// TemplateID is the template the server is set up from; 0 picks the
 	// panel's default.
 	TemplateID int64 `json:"template_id"`
@@ -89,6 +104,9 @@ var (
 	ErrPasswordRequired = errors.New("password is required")
 	// ErrNotInstallable: the server already has Xray or an installation in progress.
 	ErrNotInstallable = errors.New("server is not in a state that allows installing")
+	// ErrNoDomainToDrop: the installation was not asked to set up a domain, so
+	// there is none to go on without.
+	ErrNoDomainToDrop = errors.New("the installation has no domain to go on without")
 )
 
 // dialFunc is sshx.Dial, replaceable in tests.
@@ -108,6 +126,9 @@ type Installer struct {
 	// ForgetChecks, when set, is told that a server's availability history no
 	// longer describes it: it was just installed, or just rolled back.
 	ForgetChecks func(ctx context.Context, serverID int64) error
+	// CertChanged, when set, is told that the certificate a server shows may
+	// be another one now: it was installed, applied or renewed.
+	CertChanged func(serverID int64)
 
 	Releases *xray.Releases
 	Ops      *ops.Manager
@@ -119,6 +140,11 @@ type Installer struct {
 	dial   dialFunc
 	now    func() time.Time
 	check  *checkTarget
+	// acme is the authority that issues stub sites' certificates, acmeScript
+	// where acme.sh comes from, and resolve the panel's own view of DNS.
+	acme       ACME
+	acmeScript func(ctx context.Context) (*acmesh.Script, error)
+	resolve    func(ctx context.Context, host string) ([]string, error)
 
 	batchMu sync.Mutex
 	batches map[string]*Batch // by what is being applied: "template-3", "chain-2"
@@ -153,6 +179,10 @@ func New(srv *servers.Store, keys *sshkeys.Store, tpl *templates.Store, planner 
 		Releases: releases, Ops: manager, Log: logger,
 		latest: releases.Latest,
 		dial:   dialSSH, now: time.Now, check: check,
+		acmeScript: func(context.Context) (*acmesh.Script, error) {
+			return nil, errors.New("the panel was not told where to get acme.sh")
+		},
+		resolve: resolveHost,
 		batches: map[string]*Batch{},
 	}
 }
@@ -176,11 +206,9 @@ func (i *Installer) Start(ctx context.Context, serverID int64, params Params, pa
 	if params.Auth == AuthPassword && password == "" {
 		return nil, ErrPasswordRequired
 	}
-	maskHost, err := xray.NormalizeMaskHost(params.MaskHost)
-	if err != nil {
+	if err := params.normalize(); err != nil {
 		return nil, err
 	}
-	params.MaskHost = maskHost
 
 	srv, err := i.Servers.Get(ctx, serverID)
 	if err != nil {
@@ -202,7 +230,7 @@ func (i *Installer) Start(ctx context.Context, serverID int64, params Params, pa
 		return nil, err
 	}
 
-	op, err := i.Ops.Create(ctx, serverID, Kind, stepOrder, params)
+	op, err := i.Ops.Create(ctx, serverID, Kind, installOrder(params.Domain != ""), params)
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +238,70 @@ func (i *Installer) Start(ctx context.Context, serverID int64, params Params, pa
 		return nil, err
 	}
 	return i.Ops.Get(ctx, op.ID)
+}
+
+// normalize tidies what the server is to pass itself off as and checks it:
+// its own domain, or else someone else's site.
+func (p *Params) normalize() error {
+	if strings.TrimSpace(p.Domain) != "" {
+		domain, err := xray.NormalizeDomain(p.Domain)
+		if err != nil {
+			return err
+		}
+		p.Domain, p.MaskHost = domain, ""
+		return nil
+	}
+	maskHost, err := xray.NormalizeMaskHost(p.MaskHost)
+	if err != nil {
+		return err
+	}
+	p.Domain, p.MaskHost = "", maskHost
+	return nil
+}
+
+// Validate reports what Start would refuse about the masking, before a server
+// record exists.
+func (p Params) Validate() error { return p.normalize() }
+
+// WithoutDomain goes on with an installation that stopped because of the
+// server's own domain — the name does not lead to the server, the authority
+// would not issue a certificate — as one that masquerades as someone else's
+// site. Whatever of the stub was set up is taken away by the stub's own step;
+// the domain can be given to the server later, as a change to apply.
+func (i *Installer) WithoutDomain(ctx context.Context, operationID int64, maskHost, password string) error {
+	op, params, err := i.load(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if params.Domain == "" {
+		return ErrNoDomainToDrop
+	}
+	if op.Status != ops.StatusFailed || i.Ops.Busy(op.ServerID) {
+		return ops.ErrWrongState
+	}
+	if maskHost, err = xray.NormalizeMaskHost(maskHost); err != nil {
+		return err
+	}
+	srv, err := i.Servers.Get(ctx, op.ServerID)
+	if err != nil {
+		return err
+	}
+	// Keys made by an earlier step are kept; only what the server passes
+	// itself off as changes.
+	if srv.Inbound != nil {
+		inbound := srv.Inbound.Clone()
+		if err := inbound.SetMaskHost(maskHost); err != nil {
+			return err
+		}
+		if err := i.Servers.SetInbound(ctx, srv.ID, inbound); err != nil {
+			return err
+		}
+	}
+	params.Domain, params.MaskHost = "", maskHost
+	if err := i.Ops.SetParams(ctx, op.ID, params); err != nil {
+		return err
+	}
+	return i.run(ctx, op, params, password)
 }
 
 // Retry resumes a failed installation at the step that failed. password is
@@ -231,7 +323,7 @@ func (i *Installer) Rollback(ctx context.Context, operationID int64) error {
 	}
 	s := &session{inst: i, serverID: op.ServerID, params: params}
 	return i.launch(ctx, op.ServerID, servers.StatusInstalling, func() error {
-		return i.Ops.Rollback(op.ID, s.steps(), s.finish)
+		return i.Ops.Rollback(op.ID, s.steps(op), s.finish)
 	})
 }
 
@@ -253,7 +345,7 @@ func (i *Installer) load(ctx context.Context, operationID int64) (*ops.Operation
 func (i *Installer) run(ctx context.Context, op *ops.Operation, params Params, password string) error {
 	s := &session{inst: i, serverID: op.ServerID, params: params, password: password}
 	return i.launch(ctx, op.ServerID, servers.StatusInstalling, func() error {
-		return i.Ops.Execute(op.ID, s.steps(), s.finish)
+		return i.Ops.Execute(op.ID, s.steps(op), s.finish)
 	})
 }
 
@@ -305,6 +397,8 @@ type session struct {
 	replaced bool
 	// uninstall is what a removal was asked to do.
 	uninstall UninstallParams
+	// site is what an apply is doing to the stub site, if anything.
+	site *siteChange
 }
 
 // buildPlan works out the server's desired configuration.
@@ -320,17 +414,29 @@ func (s *session) buildPlan(ctx context.Context) (*plan.Plan, *servers.Server, e
 	return p, srv, nil
 }
 
-func (s *session) steps() []ops.Step {
-	return []ops.Step{
-		{ID: StepSSH, Run: s.stepSSH, Undo: s.undoSSH},
-		{ID: StepSystem, Run: s.stepSystem},
-		{ID: StepXray, Run: s.stepXray, Undo: s.undoXray},
-		{ID: StepKeys, Run: s.stepKeys, Undo: s.undoKeys},
-		{ID: StepConfig, Run: s.stepConfig, Undo: s.undoConfig},
-		{ID: StepService, Run: s.stepService, Undo: s.undoService},
-		{ID: StepFirewall, Run: s.stepFirewall, Undo: s.undoFirewall},
-		{ID: StepCheck, Run: s.stepCheck},
+// steps is the installation's steps as the job has them: one that was started
+// with the server's own domain keeps the stub's step whatever became of the
+// domain since.
+func (s *session) steps(op *ops.Operation) []ops.Step {
+	known := map[string]ops.Step{
+		StepSSH:      {Run: s.stepSSH, Undo: s.undoSSH},
+		StepSystem:   {Run: s.stepSystem},
+		StepXray:     {Run: s.stepXray, Undo: s.undoXray},
+		StepKeys:     {Run: s.stepKeys, Undo: s.undoKeys},
+		StepConfig:   {Run: s.stepConfig, Undo: s.undoConfig},
+		StepService:  {Run: s.stepService, Undo: s.undoService},
+		StepFirewall: {Run: s.stepFirewall, Undo: s.undoFirewall},
+		// apt and the certificate authority both take their time.
+		StepSite:  {Run: s.stepSite, Undo: s.undoSite, Timeout: siteTimeout},
+		StepCheck: {Run: s.stepCheck},
 	}
+	steps := make([]ops.Step, 0, len(op.Steps))
+	for _, state := range op.Steps {
+		step := known[state.ID]
+		step.ID = state.ID
+		steps = append(steps, step)
+	}
+	return steps
 }
 
 func (s *session) close() {
@@ -363,6 +469,14 @@ func (s *session) finish(op *ops.Operation) {
 	if err := s.inst.Servers.SetStatus(context.Background(), s.serverID, status); err != nil &&
 		!errors.Is(err, servers.ErrNotFound) {
 		s.inst.Log.Error("could not update server status", "server", s.serverID, "err", err)
+	}
+	s.inst.certChanged(s.serverID)
+}
+
+// certChanged tells whoever watches certificates to look at a server again.
+func (i *Installer) certChanged(serverID int64) {
+	if i.CertChanged != nil {
+		i.CertChanged(serverID)
 	}
 }
 

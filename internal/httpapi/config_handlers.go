@@ -157,10 +157,14 @@ type configJSON struct {
 		Name    string `json:"name"`
 		Version int    `json:"version"`
 	} `json:"template"`
-	Fields    []fieldJSON `json:"fields"`
-	MaskHost  string      `json:"mask_host"`
-	PublicKey string      `json:"public_key"`
-	ShortIDs  []string    `json:"short_ids"`
+	Fields   []fieldJSON `json:"fields"`
+	MaskHost string      `json:"mask_host"`
+	// Domain is the server's own domain as it should be, RunningDomain as the
+	// server has it now; "" is "masquerades as someone else's site".
+	Domain        string   `json:"domain"`
+	RunningDomain string   `json:"running_domain"`
+	PublicKey     string   `json:"public_key"`
+	ShortIDs      []string `json:"short_ids"`
 	// Changed lists the fields that differ from what the server runs.
 	Changed []string    `json:"changed"`
 	Diff    []plan.Line `json:"diff"`
@@ -180,6 +184,7 @@ func (s *Server) configView(ctx context.Context, srv *servers.Server) (*configJS
 	view := &configJSON{
 		Fields:    fieldViews(p.Template.Latest, p),
 		MaskHost:  p.Inbound.MaskHost(),
+		Domain:    p.Inbound.Domain,
 		PublicKey: p.Inbound.PublicKey,
 		ShortIDs:  p.Inbound.ShortIDs,
 		Changed:   p.Changed(srv.Applied),
@@ -191,6 +196,9 @@ func (s *Server) configView(ctx context.Context, srv *servers.Server) (*configJS
 	if applied := srv.Applied; applied != nil {
 		view.AppliedAt, view.AppliedTemplateVersion = &applied.At, &applied.TemplateVersion
 		view.Diff = plan.Diff(plan.MaskSecrets(applied.Config), view.Config)
+		if applied.Inbound != nil {
+			view.RunningDomain = applied.Inbound.Domain
+		}
 	}
 
 	history, err := s.ops.ListForServer(ctx, srv.ID, 20)
@@ -242,9 +250,12 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 type updateConfigRequest struct {
 	// Overrides sets (a string) or clears (null) the server's own value for a
 	// template field. Fields not mentioned are left alone.
-	Overrides  map[string]*string `json:"overrides"`
-	MaskHost   *string            `json:"mask_host"`
-	TemplateID *int64             `json:"template_id"`
+	Overrides map[string]*string `json:"overrides"`
+	// MaskHost makes the server masquerade as someone else's site; Domain, as
+	// its own domain, with a stub site that the apply sets up. One or neither.
+	MaskHost   *string `json:"mask_host"`
+	Domain     *string `json:"domain"`
+	TemplateID *int64  `json:"template_id"`
 }
 
 // handleUpdateConfig changes what the server should run. Nothing reaches the
@@ -302,7 +313,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.MaskHost != nil {
+	switch {
+	case req.Domain != nil && req.MaskHost != nil:
+		writeError(w, http.StatusUnprocessableEntity, "invalid_field",
+			"Give the server's own domain or the site to masquerade as, not both.", nil)
+		return
+	case req.Domain != nil:
+		inbound := srv.Inbound.Clone()
+		if s.serverError(w, r, inbound.SetDomain(*req.Domain)) {
+			return
+		}
+		change.Inbound = inbound
+	case req.MaskHost != nil:
 		inbound := srv.Inbound.Clone()
 		if s.serverError(w, r, inbound.SetMaskHost(*req.MaskHost)) {
 			return

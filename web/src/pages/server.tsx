@@ -4,12 +4,8 @@ import { useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
-import {
-  AccessFields,
-  CopyBlock,
-  MaskField,
-  TemplateField,
-} from '@/components/install-fields'
+import { AccessFields, CopyBlock, TemplateField } from '@/components/install-fields'
+import { MaskField } from '@/components/mask-field'
 import { Page, PageHeader, Panel } from '@/components/page'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -27,6 +23,7 @@ import {
   toInstallOptions,
 } from '@/lib/install-form'
 import { explained, failureValues } from '@/lib/failures'
+import { formatDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 import { StepList, LogView } from '@/components/operation-view'
@@ -127,6 +124,7 @@ function FailurePanel({ server, operation }: { server: Server; operation: Operat
   const { t } = useTranslation()
   const refresh = useRefreshServer(server)
   const [password, setPassword] = useState('')
+  const [maskHost, setMaskHost] = useState('')
 
   const failure = operation.error!
   const code = explained(failure.code)
@@ -153,7 +151,19 @@ function FailurePanel({ server, operation }: { server: Server; operation: Operat
     mutationFn: () => api.rollbackOperation(operation.id),
     onSettled: refresh,
   })
-  const busy = retry.isPending || rollback.isPending
+  // An installation that was to set up the server's own domain can be gone
+  // on with as one that masquerades as someone else's site.
+  const hasDomain = operation.kind === 'install' && (operation.params.domain ?? '') !== ''
+  const withoutDomain = useMutation({
+    mutationFn: () =>
+      api.continueWithoutDomain(
+        operation.id,
+        maskHost.trim(),
+        needsPassword ? password : undefined,
+      ),
+    onSettled: refresh,
+  })
+  const busy = retry.isPending || rollback.isPending || withoutDomain.isPending
 
   const handleRetry = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -260,6 +270,56 @@ function FailurePanel({ server, operation }: { server: Server; operation: Operat
             </span>
           </div>
         </div>
+        {hasDomain && !duringRollback && (
+          <div className="flex max-w-xl flex-col gap-2 rounded-lg border p-3">
+            <span className="font-medium">{t('server.failed.withoutDomain.title')}</span>
+            <span className="text-xs text-muted-foreground">
+              {t('server.failed.withoutDomain.hint')}
+            </span>
+            <div className="flex flex-wrap items-end gap-2">
+              <Field>
+                <Label htmlFor="without-domain-host">{t('installForm.maskHost')}</Label>
+                <Input
+                  id="without-domain-host"
+                  className="w-64 max-w-full font-mono"
+                  placeholder={t('installForm.maskHostPlaceholder')}
+                  autoComplete="off"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  value={maskHost}
+                  onChange={(event) => setMaskHost(event.target.value)}
+                  // Enter here is this choice, not "retry the step" of the form around it.
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      if (maskHost.trim() !== '' && !busy) {
+                        withoutDomain.mutate()
+                      }
+                    }
+                  }}
+                />
+              </Field>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={busy || maskHost.trim() === ''}
+                onClick={() => withoutDomain.mutate()}
+              >
+                {withoutDomain.isPending
+                  ? t('server.failed.retrying')
+                  : t('server.failed.withoutDomain.submit')}
+              </Button>
+            </div>
+            {withoutDomain.isError && (
+              <span role="alert" className="text-xs text-destructive">
+                {withoutDomain.error instanceof ApiError &&
+                withoutDomain.error.code === 'invalid_mask_host'
+                  ? t('serverNew.errors.invalid_mask_host')
+                  : t('server.failed.actionFailed')}
+              </span>
+            )}
+          </div>
+        )}
         {(retry.isError || rollback.isError) && (
           <Notice title={t('server.failed.actionFailed')} />
         )}
@@ -280,12 +340,15 @@ export function FreshView({
   const { t } = useTranslation()
   const refresh = useRefreshServer(server)
   // What was chosen last time is the likeliest choice now: a server added
-  // with the panel's key already on it is not asked for a password again.
+  // with the panel's key already on it is not asked for a password again, and
+  // one that was to have its own domain is offered that domain.
   const [install, setInstall] = useState(() => ({
     ...initialInstallForm,
     auth: lastOperation?.params.auth ?? initialInstallForm.auth,
     disablePasswordLogin:
       lastOperation?.params.disable_password_login ?? initialInstallForm.disablePasswordLogin,
+    maskMode: lastOperation?.params.domain ? ('domain' as const) : initialInstallForm.maskMode,
+    domain: lastOperation?.params.domain ?? '',
     maskHost: lastOperation?.params.mask_host ?? '',
   }))
   const [deleting, setDeleting] = useState(false)
@@ -333,7 +396,7 @@ export function FreshView({
         </Panel>
         <Panel title={t('installForm.maskTitle')}>
           <TemplateField value={install} onChange={setInstall} />
-          <MaskField value={install} onChange={setInstall} />
+          <MaskField value={install} onChange={setInstall} host={server.host} />
         </Panel>
         {error !== null && <Notice title={error} />}
         <Button type="submit" className="self-start" disabled={start.isPending}>
@@ -363,6 +426,12 @@ export function InstallSummary({
 
   const handshake = result.handshake_ms
   const httpStatus = result.http_status
+  // The server's own domain: when its certificate runs out, as the
+  // installation read it or as the panel has seen it since.
+  const domain = inbound?.domain ?? ''
+  const certUntil =
+    server.cert?.not_after ??
+    (typeof result.cert_not_after === 'number' ? result.cert_not_after : null)
   const duration = feed ? formatDuration(feed.operation, t) : null
 
   return (
@@ -376,7 +445,12 @@ export function InstallSummary({
           </h2>
           <p className="text-muted-foreground">{t('server.done.description')}</p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-3">
+        <div
+          className={cn(
+            'grid gap-4',
+            domain !== '' ? 'sm:grid-cols-2 xl:grid-cols-4' : 'sm:grid-cols-3',
+          )}
+        >
           {typeof handshake === 'number' && (
             <Tile
               label={t('server.done.handshake')}
@@ -392,6 +466,13 @@ export function InstallSummary({
                 mode: inbound.xhttp_mode,
                 path: inbound.xhttp_path,
               })}
+            />
+          )}
+          {domain !== '' && certUntil !== null && (
+            <Tile
+              label={t('server.done.cert')}
+              value={t('server.done.certValue', { date: formatDate(certUntil) })}
+              note={t('server.done.certNote', { domain })}
             />
           )}
           <Tile
@@ -413,7 +494,10 @@ export function InstallSummary({
             </Fact>
             {inbound && (
               <>
-                <Fact label={t('server.done.maskHost')} mono>
+                <Fact
+                  label={domain !== '' ? t('server.done.domain') : t('server.done.maskHost')}
+                  mono
+                >
                   {inbound.mask_host}
                 </Fact>
                 <Fact label={t('server.done.port')} mono>

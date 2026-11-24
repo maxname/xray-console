@@ -318,6 +318,28 @@ func (m *Manager) Get(ctx context.Context, id int64) (*Operation, error) {
 	return m.scan(m.db.QueryRowContext(ctx, `SELECT `+columns+` FROM operations WHERE id = ?`, id))
 }
 
+// SetParams replaces what a job was asked to do — for one that stopped and is
+// to be gone on with differently. Only a job that is not running: a running
+// one has already read its own.
+func (m *Manager) SetParams(ctx context.Context, id int64, params any) error {
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	result, err := m.db.ExecContext(ctx, `UPDATE operations SET params = ? WHERE id = ? AND status = ?`,
+		string(encoded), id, StatusFailed)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		if _, err := m.Get(ctx, id); err != nil {
+			return err
+		}
+		return ErrWrongState
+	}
+	return nil
+}
+
 const columns = `id, server_id, device_id, kind, status, steps, error, params, result, started_at, finished_at`
 
 // Prune deletes jobs that finished before the cutoff, logs with them. The
@@ -540,6 +562,11 @@ func (r *Run) SetResult(key string, value any) {
 		r.op.Result = map[string]any{}
 	}
 	r.op.Result[key] = value
+}
+
+// Result returns a fact an earlier step of the job recorded, or nil.
+func (r *Run) Result(key string) any {
+	return r.op.Result[key]
 }
 
 // Execute runs the job's steps in the background, starting at the first one

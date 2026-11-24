@@ -138,28 +138,7 @@ export function TemplateField({ value, onChange }: FieldsProps) {
   )
 }
 
-/** The site REALITY passes the server off as. */
-export function MaskField({ value, onChange }: FieldsProps) {
-  const { t } = useTranslation()
-  return (
-    <Field hint={t('installForm.maskHostHint')}>
-      <Label htmlFor="install-mask-host">{t('installForm.maskHost')}</Label>
-      <Input
-        id="install-mask-host"
-        className="font-mono"
-        placeholder={t('installForm.maskHostPlaceholder')}
-        autoComplete="off"
-        spellCheck={false}
-        autoCapitalize="off"
-        required
-        value={value.maskHost}
-        onChange={(event) => onChange({ ...value, maskHost: event.target.value })}
-      />
-    </Field>
-  )
-}
-
-function RadioCard({
+export function RadioCard({
   name,
   checked,
   onSelect,

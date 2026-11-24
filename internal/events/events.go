@@ -25,6 +25,9 @@ const (
 	// XrayUninstalled: Xray was removed from a server, and the server from
 	// the panel with it.
 	XrayUninstalled = "xray_uninstalled"
+	// CertRenewed: the certificate of a server's own domain was replaced by
+	// one that lasts longer.
+	CertRenewed = "cert_renewed"
 )
 
 // kept is how long events stay.

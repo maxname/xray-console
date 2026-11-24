@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"xray-console/internal/certs"
 	"xray-console/internal/probe"
 	"xray-console/internal/servers"
 )
@@ -55,6 +56,9 @@ type Notifier struct {
 	// it. Either may be nil in a panel that does not offer updates.
 	Latest   func(ctx context.Context) (string, error)
 	Outdated func(ctx context.Context, version string) ([]*servers.Server, error)
+	// Certs is what is known about the certificates of servers with their own
+	// domain. May be nil in a panel that does not watch them.
+	Certs *certs.Store
 
 	Client *http.Client
 	// TelegramAPI is the bot API's address; DefaultTelegramAPI unless a test
@@ -98,6 +102,11 @@ func (n *Notifier) Tick(ctx context.Context) {
 	}
 	if settings.OnUpdate {
 		n.watchRelease(ctx, now)
+	}
+	if settings.OnCert {
+		if err := n.watchCerts(ctx, now); err != nil && ctx.Err() == nil {
+			n.Log.Warn("could not check certificates for alerts", "err", err)
+		}
 	}
 	if settings.QuietHours && quiet(now) {
 		return
@@ -230,6 +239,45 @@ func (n *Notifier) watchRelease(ctx context.Context, now time.Time) {
 	if err != nil && ctx.Err() == nil {
 		n.Log.Warn("could not queue the release announcement", "err", err)
 	}
+}
+
+// watchCerts tells, once for each certificate, that it was not renewed when
+// it should have been: acme.sh on the server renews long before a
+// certificate's end, so one that got this close to it is not being renewed.
+// A renewal makes it another certificate, and the next one is told again.
+func (n *Notifier) watchCerts(ctx context.Context, now time.Time) error {
+	if n.Certs == nil {
+		return nil
+	}
+	known, err := n.Certs.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, cert := range known {
+		if !cert.Overdue(now) || cert.Told() {
+			continue
+		}
+		srv, err := n.Servers.Get(ctx, cert.ServerID)
+		if err != nil {
+			// Removed since the certificate was last looked at.
+			continue
+		}
+		err = n.Store.enqueue(ctx, Message{
+			At: now, Kind: KindCertNotRenewed, Server: srv.Name,
+			Text: textCert(srv.Name, cert.Domain, cert.NotAfter, now),
+			Data: map[string]any{
+				"domain": cert.Domain, "not_after": cert.NotAfter.Unix(),
+				"days_left": int64(cert.NotAfter.Sub(now) / (24 * time.Hour)),
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if err := n.Certs.MarkTold(ctx, cert.ServerID, cert.NotAfter); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deliver sends everything that is due: to Telegram as one message (several

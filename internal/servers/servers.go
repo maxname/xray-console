@@ -38,7 +38,8 @@ const (
 // Change is one thing the panel did to a server — the unit of the "what was
 // changed" list and, later, of uninstalling.
 type Change struct {
-	// Kind groups changes for display: files | service | firewall | ssh | user.
+	// Kind groups changes for display: files | service | firewall | ssh | user |
+	// packages | site.
 	Kind string `json:"kind"`
 	// Text is the thing itself, as a person would name it:
 	// "/usr/local/bin/xray", "443/tcp (ufw)".
@@ -396,6 +397,19 @@ func (s *Store) AddChange(ctx context.Context, id int64, change Change) error {
 			}
 		}
 		return append(manifest, change)
+	})
+}
+
+// RemoveChange drops one change, exactly as it was recorded.
+func (s *Store) RemoveChange(ctx context.Context, id int64, change Change) error {
+	return s.editManifest(ctx, id, func(manifest []Change) []Change {
+		kept := manifest[:0]
+		for _, existing := range manifest {
+			if existing != change {
+				kept = append(kept, existing)
+			}
+		}
+		return kept
 	})
 }
 

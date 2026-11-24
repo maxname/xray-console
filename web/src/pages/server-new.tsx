@@ -5,7 +5,8 @@ import { useTranslation } from 'react-i18next'
 
 import { Field, Notice } from '@/components/auth-layout'
 import { HostKeyCheck } from '@/components/host-key-check'
-import { AccessFields, MaskField, TemplateField } from '@/components/install-fields'
+import { AccessFields, TemplateField } from '@/components/install-fields'
+import { MaskField } from '@/components/mask-field'
 import { Page, PageHeader, Panel } from '@/components/page'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -182,7 +183,7 @@ export function ServerNewPage() {
 
         <Panel title={t('installForm.maskTitle')}>
           <TemplateField value={install} onChange={setInstall} />
-          <MaskField value={install} onChange={setInstall} />
+          <MaskField value={install} onChange={setInstall} host={host} />
         </Panel>
 
         {formError !== null && <Notice title={formError} />}

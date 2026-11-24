@@ -29,7 +29,8 @@ import { Breadcrumb } from '@/components/server-parts'
 import { UninstallDialog, UpdateButton, UpdateStatus } from '@/pages/server-lifecycle'
 
 import { configKey, useServerConfig, fieldLabel, explain } from '@/lib/server-config'
-import { Labelled, TextControl, FieldRow, TemplatePanel } from '@/pages/server-settings-fields'
+import { MaskPanel } from '@/pages/server-mask'
+import { Labelled, FieldRow, TemplatePanel } from '@/pages/server-settings-fields'
 import { ApplyProgress, ApplyFailed, RotateDialog } from '@/pages/server-apply'
 import { DiffView, HistoryList, ConfigTab } from '@/pages/server-config-tab'
 
@@ -314,19 +315,6 @@ function SettingsTab({ server, feed }: { server: Server; feed: OperationFeed | n
         <Panel title={t('config.reality.title')}>
           {renderField('inbound.port')}
           <Labelled
-            label={t('fields.reality.maskHost')}
-            htmlFor="config-mask-host"
-            hint={t('config.reality.maskHostHint')}
-            error={errors.maskHost}
-          >
-            <TextControl
-              id="config-mask-host"
-              value={config.mask_host}
-              disabled={busy}
-              onCommit={(value) => update('maskHost', { mask_host: value })}
-            />
-          </Labelled>
-          <Labelled
             label={t('fields.reality.publicKey')}
             hint={t('config.reality.publicKeyHint', { name: server.name })}
           >
@@ -372,6 +360,21 @@ function SettingsTab({ server, feed }: { server: Server; feed: OperationFeed | n
             </Button>
           </div>
         </Panel>
+
+        <MaskPanel
+          server={server}
+          config={config}
+          disabled={busy}
+          onUpdate={async (body) => {
+            try {
+              setConfig(await api.updateServerConfig(server.id, body))
+              void queryClient.invalidateQueries({ queryKey: ['servers'], exact: true })
+              return null
+            } catch (error) {
+              return explain(t, error)
+            }
+          }}
+        />
 
         <Panel title={t('config.xhttp.title')}>
           {renderField('xhttp.mode')}

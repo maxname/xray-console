@@ -16,6 +16,7 @@ import (
 
 	"xray-console/internal/alerts"
 	"xray-console/internal/auth"
+	"xray-console/internal/certs"
 	"xray-console/internal/chains"
 	"xray-console/internal/devices"
 	"xray-console/internal/events"
@@ -58,6 +59,7 @@ type Server struct {
 	traffic        *traffic.Store
 	alerts         *alerts.Store
 	notifier       *alerts.Notifier
+	certs          *certs.Store
 	devices        *devices.Store
 	deviceManager  *devices.Manager
 	localClient    *localclient.Client
@@ -84,6 +86,7 @@ type Options struct {
 	Traffic   *traffic.Store
 	Alerts    *alerts.Store
 	Notifier  *alerts.Notifier
+	Certs     *certs.Store
 	Devices   *devices.Manager
 	Local     *localclient.Client
 	Ops       *ops.Manager
@@ -111,6 +114,7 @@ func New(opts Options) *Server {
 		traffic:        opts.Traffic,
 		alerts:         opts.Alerts,
 		notifier:       opts.Notifier,
+		certs:          opts.Certs,
 		devices:        opts.Devices.Store,
 		deviceManager:  opts.Devices,
 		localClient:    opts.Local,
@@ -156,6 +160,9 @@ func (s *Server) Handler() http.Handler {
 	api.Handle("POST /api/operations/{id}/retry", s.requireAuth(s.handleRetryOperation))
 	api.Handle("POST /api/operations/{id}/rollback", s.requireAuth(s.handleRollbackOperation))
 	api.Handle("POST /api/operations/{id}/cancel", s.requireAuth(s.handleCancelOperation))
+	api.Handle("POST /api/operations/{id}/without-domain", s.requireAuth(s.handleWithoutDomain))
+	api.Handle("POST /api/domains/check", s.requireAuth(s.handleCheckDomain))
+	api.Handle("POST /api/servers/{id}/cert/renew", s.requireAuth(s.handleRenewCert))
 
 	api.Handle("GET /api/servers/{id}/config", s.requireAuth(s.handleGetConfig))
 	api.Handle("PUT /api/servers/{id}/config", s.requireAuth(s.handleUpdateConfig))

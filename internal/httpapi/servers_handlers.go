@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"xray-console/internal/certs"
 	"xray-console/internal/events"
 	"xray-console/internal/install"
 	"xray-console/internal/ops"
@@ -20,8 +21,11 @@ import (
 // --- JSON shapes ---------------------------------------------------------------
 
 type inboundJSON struct {
-	Port      int    `json:"port"`
-	MaskHost  string `json:"mask_host"`
+	Port     int    `json:"port"`
+	MaskHost string `json:"mask_host"`
+	// Domain is the server's own domain, "" when it masquerades as someone
+	// else's site.
+	Domain    string `json:"domain"`
 	PublicKey string `json:"public_key"`
 	// ShortIDs is a count: the values are credentials and are shown where they
 	// are needed, not in every listing.
@@ -52,6 +56,38 @@ type serverJSON struct {
 	Template *serverTemplateJSON `json:"template"`
 	// Check is nil until the server is installed and has been checked once.
 	Check *checkJSON `json:"check"`
+	// Cert is the certificate of the server's own domain as the panel last
+	// saw it; nil for a server without one, or one not looked at yet.
+	Cert *certJSON `json:"cert"`
+}
+
+// certJSON is a server's certificate as the panel last saw it from outside.
+type certJSON struct {
+	Domain string `json:"domain"`
+	// NotAfter is when it runs out; nil until a certificate has been read.
+	NotBefore *int64 `json:"not_before"`
+	NotAfter  *int64 `json:"not_after"`
+	Issuer    string `json:"issuer"`
+	CheckedAt int64  `json:"checked_at"`
+	// Error is why the last look found no certificate good for the domain.
+	Error string `json:"error"`
+	// Overdue: it should have been renewed by now and was not.
+	Overdue bool `json:"overdue"`
+}
+
+func certView(state *certs.State, now time.Time) *certJSON {
+	if state == nil {
+		return nil
+	}
+	view := &certJSON{
+		Domain: state.Domain, Issuer: state.Issuer, CheckedAt: state.CheckedAt.Unix(),
+		Error: state.Error, Overdue: state.Overdue(now),
+	}
+	if !state.NotAfter.IsZero() {
+		before, after := state.NotBefore.Unix(), state.NotAfter.Unix()
+		view.NotBefore, view.NotAfter = &before, &after
+	}
+	return view
 }
 
 // serverTemplateJSON is a server's standing with its template, for the list.
@@ -84,7 +120,7 @@ func (s *Server) serverView(ctx context.Context, srv *servers.Server) (serverJSO
 	// is safe to send to a browser.
 	if in := srv.Inbound; in != nil {
 		view.Inbound = &inboundJSON{
-			Port: in.Port, MaskHost: in.MaskHost(), PublicKey: in.PublicKey,
+			Port: in.Port, MaskHost: in.MaskHost(), Domain: in.Domain, PublicKey: in.PublicKey,
 			ShortIDs: len(in.ShortIDs), XHTTPPath: in.XHTTPPath, XHTTPMode: in.XHTTPMode,
 		}
 	}
@@ -110,6 +146,11 @@ func (s *Server) serverView(ctx context.Context, srv *servers.Server) (serverJSO
 	if view.Check, err = s.checkView(ctx, srv); err != nil {
 		return view, err
 	}
+	cert, err := s.certs.Get(ctx, srv.ID)
+	if err != nil {
+		return view, err
+	}
+	view.Cert = certView(cert, time.Now())
 	return view, nil
 }
 
@@ -173,6 +214,12 @@ func (s *Server) serverError(w http.ResponseWriter, r *http.Request, err error) 
 		writeError(w, http.StatusUnprocessableEntity, "invalid_user", err.Error(), nil)
 	case errors.Is(err, xray.ErrInvalidMaskHost):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_mask_host", err.Error(), nil)
+	case errors.Is(err, xray.ErrInvalidDomain):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_domain", err.Error(), nil)
+	case errors.Is(err, install.ErrNoDomain):
+		writeError(w, http.StatusConflict, "no_domain", err.Error(), nil)
+	case errors.Is(err, install.ErrNoDomainToDrop):
+		writeError(w, http.StatusConflict, "wrong_state", err.Error(), nil)
 	case errors.Is(err, install.ErrInvalidAuth):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_auth", err.Error(), nil)
 	case errors.Is(err, install.ErrPasswordRequired):
@@ -272,13 +319,16 @@ type installRequest struct {
 	Password             string `json:"password"`
 	DisablePasswordLogin bool   `json:"disable_password_login"`
 	MaskHost             string `json:"mask_host"`
-	TemplateID           int64  `json:"template_id"`
+	// Domain, when given, is the server's own domain: it gets a stub site and
+	// a certificate, and MaskHost plays no part.
+	Domain     string `json:"domain"`
+	TemplateID int64  `json:"template_id"`
 }
 
 func (req installRequest) params() install.Params {
 	return install.Params{
 		Auth: req.Auth, DisablePasswordLogin: req.DisablePasswordLogin,
-		MaskHost: req.MaskHost, TemplateID: req.TemplateID,
+		MaskHost: req.MaskHost, Domain: req.Domain, TemplateID: req.TemplateID,
 	}
 }
 
@@ -290,8 +340,7 @@ func (req installRequest) validate() error {
 	if req.Auth == install.AuthPassword && req.Password == "" {
 		return install.ErrPasswordRequired
 	}
-	_, err := xray.NormalizeMaskHost(req.MaskHost)
-	return err
+	return req.params().Validate()
 }
 
 type createServerRequest struct {
@@ -560,6 +609,78 @@ func (s *Server) handleRetryOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type withoutDomainRequest struct {
+	// MaskHost is the site the server is to pass itself off as instead.
+	MaskHost string `json:"mask_host"`
+	Password string `json:"password"`
+}
+
+// handleWithoutDomain goes on with an installation that stopped over the
+// server's own domain, as one that masquerades as someone else's site.
+func (s *Server) handleWithoutDomain(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var req withoutDomainRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if s.serverError(w, r, s.installer.WithoutDomain(r.Context(), id, req.MaskHost, req.Password)) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type domainCheckRequest struct {
+	Domain string `json:"domain"`
+	// Host is the server's address, as typed into the form or as the panel
+	// has it.
+	Host string `json:"host"`
+}
+
+// handleCheckDomain says where a domain leads and whether that is the server:
+// what the administrator wants to know before an installation finds it out.
+func (s *Server) handleCheckDomain(w http.ResponseWriter, r *http.Request) {
+	var req domainCheckRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// The address is looked up too when it is a name; any valid user will do.
+	if s.serverError(w, r, servers.ValidateTarget(req.Host, 22, "root")) {
+		return
+	}
+	check, err := s.installer.CheckDomain(r.Context(), req.Domain, req.Host, nil)
+	if errors.Is(err, xray.ErrInvalidDomain) {
+		s.serverError(w, r, err)
+		return
+	}
+	if err != nil {
+		// The panel's own resolver did not answer; its words stay in the log.
+		s.log.Warn("could not resolve a domain", "err", err)
+		writeError(w, http.StatusBadGateway, "dns_failed", "The panel could not ask DNS.", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, check)
+}
+
+// handleRenewCert has the server obtain a new certificate for its domain now.
+func (s *Server) handleRenewCert(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	// The authority answers in seconds, but waits its own retries out.
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	renewal, err := s.installer.RenewCert(ctx, id)
+	if s.configError(w, r, err) {
+		return
+	}
+	s.log.Info("certificate renewed by hand", "server", id, "domain", renewal.Domain)
+	writeJSON(w, http.StatusOK, renewal)
 }
 
 func (s *Server) handleRollbackOperation(w http.ResponseWriter, r *http.Request) {

@@ -20,7 +20,11 @@ import (
 
 // Fields that belong to one server rather than to its template.
 const (
-	FieldMaskHost  = "reality.maskHost"
+	FieldMaskHost = "reality.maskHost"
+	// FieldDomain is the server's own domain, empty when it masquerades as
+	// someone else's site. With FieldMaskHost it tells "the same name, but now
+	// answered by a stub site here" from no change at all.
+	FieldDomain    = "reality.domain"
 	FieldPublicKey = "reality.publicKey"
 	FieldShortIDs  = "reality.shortIds"
 	// FieldChains stands for everything the server does as a link of chains:
@@ -99,6 +103,7 @@ func Build(srv *servers.Server, tpl *templates.Template, routing *xray.Routing) 
 		return nil, err
 	}
 	fields[FieldMaskHost] = inbound.MaskHost()
+	fields[FieldDomain] = inbound.Domain
 	fields[FieldPublicKey] = inbound.PublicKey
 	fields[FieldShortIDs] = strings.Join(inbound.ShortIDs, ",")
 	fields[FieldRevision] = xray.ConfigRevision
@@ -156,8 +161,8 @@ func digest(value any) (string, error) {
 
 // order is how changed fields are listed.
 func order() []string {
-	keys := make([]string, 0, len(templates.Fields)+3)
-	keys = append(keys, FieldMaskHost)
+	keys := make([]string, 0, len(templates.Fields)+7)
+	keys = append(keys, FieldMaskHost, FieldDomain)
 	for _, f := range templates.Fields {
 		keys = append(keys, f.Key)
 	}

@@ -16,6 +16,7 @@ import (
 
 	"xray-console/internal/alerts"
 	"xray-console/internal/auth"
+	"xray-console/internal/certs"
 	"xray-console/internal/chains"
 	"xray-console/internal/devices"
 	"xray-console/internal/events"
@@ -54,6 +55,7 @@ type harness struct {
 	notifier  *alerts.Notifier
 	devices   *devices.Manager
 	local     *localclient.Client
+	certs     *certs.Store
 }
 
 func newHarness(t *testing.T, trusted ...netip.Prefix) *harness {
@@ -89,6 +91,7 @@ func newHarness(t *testing.T, trusted ...netip.Prefix) *harness {
 	prober := probe.NewProber(serverStore, probeStore, eventStore, manager, logger)
 	trafficStore := traffic.NewStore(db)
 	alertStore := alerts.NewStore(db, box)
+	certStore := certs.NewStore(db)
 	notifier := &alerts.Notifier{
 		Store: alertStore, Servers: serverStore, State: probeStore.StateOf, Log: logger,
 	}
@@ -122,6 +125,7 @@ func newHarness(t *testing.T, trusted ...netip.Prefix) *harness {
 		Traffic:        trafficStore,
 		Alerts:         alertStore,
 		Notifier:       notifier,
+		Certs:          certStore,
 		Devices:        deviceManager,
 		Local:          localClient,
 		Ops:            manager,
@@ -138,7 +142,7 @@ func newHarness(t *testing.T, trusted ...netip.Prefix) *harness {
 		t: t, server: server, client: &http.Client{Jar: jar}, auth: authService,
 		servers: serverStore, templates: templateStore, planner: configPlanner,
 		installer: installer, traffic: trafficStore, probes: probeStore, events: eventStore,
-		notifier: notifier, devices: deviceManager, local: localClient,
+		notifier: notifier, devices: deviceManager, local: localClient, certs: certStore,
 	}
 }
 

@@ -89,7 +89,15 @@ export type ServerStatus = 'new' | 'installing' | 'failed' | 'ready' | 'uninstal
 
 /** One thing the panel changed on a server. */
 export interface ServerChange {
-  kind: 'ssh_key' | 'ssh_password' | 'files' | 'user' | 'service' | 'firewall'
+  kind:
+    | 'ssh_key'
+    | 'ssh_password'
+    | 'files'
+    | 'user'
+    | 'service'
+    | 'firewall'
+    | 'packages'
+    | 'site'
   text: string
 }
 
@@ -97,6 +105,8 @@ export interface ServerChange {
 export interface ServerInbound {
   port: number
   mask_host: string
+  /** The server's own domain; "" when it masquerades as someone else's site. */
+  domain: string
   public_key: string
   /** How many shortIds exist — not the values. */
   short_ids: number
@@ -126,6 +136,44 @@ export interface Server {
   template: ServerTemplate | null
   /** Null until the server is installed and has been checked once. */
   check: ServerCheck | null
+  /** The certificate of the server's own domain; null without one, or before the first look. */
+  cert: ServerCert | null
+}
+
+/** A server's certificate as the panel last saw it from outside. */
+export interface ServerCert {
+  domain: string
+  /** Unix seconds; null until a certificate has been read. */
+  not_before: number | null
+  not_after: number | null
+  issuer: string
+  checked_at: number
+  /** Why the last look found no certificate good for the domain; "" when it did. */
+  error: string
+  /** It should have been renewed by now and was not. */
+  overdue: boolean
+}
+
+export interface OverviewCert extends ServerCert {
+  server_id: number
+  server_name: string
+}
+
+/** Where a domain leads, compared with where a server is. */
+export interface DomainCheck {
+  domain: string
+  addresses: string[]
+  expected: string[]
+  /** At least one of the domain's addresses is the server's. */
+  match: boolean
+  /** Addresses of the domain that are not known to be the server's. */
+  other: string[]
+}
+
+export interface CertRenewal {
+  domain: string
+  /** Unix seconds; 0 when the server did not say. */
+  not_after: number
 }
 
 /** Where a server stands with the availability checks. */
@@ -172,6 +220,7 @@ export type EventKind =
   | 'xray_updated'
   | 'update_failed'
   | 'xray_uninstalled'
+  | 'cert_renewed'
 
 export interface PanelEvent {
   id: number
@@ -202,6 +251,8 @@ export interface Overview {
   /** How many servers count traffic at all. */
   counting: number
   events: PanelEvent[]
+  /** Certificates of servers with their own domain, the one that runs out first at the top. */
+  certs: OverviewCert[]
 }
 
 /** Bytes from clients to the servers (up) and from the servers to clients (down). */
@@ -272,6 +323,7 @@ export interface AlertSettings {
   on_down: boolean
   on_up: boolean
   on_update: boolean
+  on_cert: boolean
   down_after_minutes: number
   /** 0 never, else every 1 or 6 hours. */
   repeat_hours: number
@@ -342,6 +394,9 @@ export interface ServerConfig {
   template: { id: number; name: string; version: number }
   fields: ConfigField[]
   mask_host: string
+  /** The server's own domain as it should be, and as the server has it now. */
+  domain: string
+  running_domain: string
   public_key: string
   short_ids: string[]
   /** Field keys that differ from what the server runs. */
@@ -358,7 +413,9 @@ export interface ServerConfig {
 export interface UpdateConfigRequest {
   /** A string sets the server's own value; null goes back to the template's. */
   overrides?: Record<string, string | null>
+  /** Someone else's site to masquerade as, or the server's own domain: one of the two. */
   mask_host?: string
+  domain?: string
   template_id?: number
 }
 
@@ -663,7 +720,9 @@ export interface InstallOptions {
   /** Only with auth "password". Used once and not stored. */
   password?: string
   disable_password_login: boolean
-  mask_host: string
+  /** Someone else's site to masquerade as, or the server's own domain: one of the two. */
+  mask_host?: string
+  domain?: string
   /** Omitted or 0: the panel's default template. */
   template_id?: number
 }
@@ -688,6 +747,7 @@ export type StepId =
   | 'config'
   | 'service'
   | 'firewall'
+  | 'site'
   | 'check'
 
 export type StepStatus = 'pending' | 'running' | 'done' | 'failed' | 'undone'
@@ -939,6 +999,20 @@ export const api = {
 
   cancelOperation: (id: number) =>
     request<OkResponse>('POST', `/api/operations/${id}/cancel`),
+
+  /** Goes on with an installation that stopped over the domain, as one without it. */
+  continueWithoutDomain: (id: number, maskHost: string, password?: string) =>
+    request<OkResponse>('POST', `/api/operations/${id}/without-domain`, {
+      mask_host: maskHost,
+      password: password ?? '',
+    }),
+
+  checkDomain: (domain: string, host: string) =>
+    request<DomainCheck>('POST', '/api/domains/check', { domain, host }),
+
+  /** Has the server obtain a new certificate for its domain now. */
+  renewCert: (id: number) =>
+    request<CertRenewal>('POST', `/api/servers/${id}/cert/renew`),
 
   getServerConfig: (id: number) =>
     request<ServerConfig>('GET', `/api/servers/${id}/config`),

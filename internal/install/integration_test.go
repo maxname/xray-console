@@ -59,10 +59,13 @@ type rig struct {
 	target    sshx.Target
 }
 
-func newRig(t *testing.T) *rig {
-	host := os.Getenv("XC_TEST_NODE")
+func newRig(t *testing.T) *rig { return newRigAt(t, "XC_TEST_NODE") }
+
+// newRigAt is a rig for the node whose address the named variable holds.
+func newRigAt(t *testing.T, variable string) *rig {
+	host := os.Getenv(variable)
 	if host == "" {
-		t.Skip("XC_TEST_NODE is not set")
+		t.Skip(variable + " is not set")
 	}
 	ctx := context.Background()
 	db, err := store.OpenMemory(ctx)

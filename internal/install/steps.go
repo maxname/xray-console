@@ -350,18 +350,27 @@ func (s *session) stepSystem(ctx context.Context, run *ops.Run) error {
 		return ops.Fail(CodeXrayExists, "Xray is already installed on the server", nil)
 	}
 
-	// Needs root to see which process owns the socket.
-	port := strconv.Itoa(xray.DefaultPort)
-	listener, err := s.sudo(ctx, run, "ss -H -ltnp 'sport = :"+port+"' | head -n 1")
+	details, busy, err := s.portHolder(ctx, run, xray.DefaultPort)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(listener) != "" {
-		details := map[string]any{"port": xray.DefaultPort}
-		if match := listenerPattern.FindStringSubmatch(listener); match != nil {
-			details["process"], details["pid"] = match[1], match[2]
+	if busy {
+		return ops.Fail(CodePortInUse, fmt.Sprintf("port %d is in use: %v", xray.DefaultPort, details["listener"]), details)
+	}
+
+	// A server that is to masquerade as its own domain needs more to be true,
+	// and it is found out here — before anything on the server is changed.
+	if domain := s.params.Domain; domain != "" {
+		if err := s.sitePreflight(ctx, run); err != nil {
+			return err
 		}
-		return ops.Fail(CodePortInUse, "port "+port+" is in use: "+strings.TrimSpace(listener), details)
+		srv, err := s.server(ctx)
+		if err != nil {
+			return err
+		}
+		if err := s.domainPointsHere(ctx, run, srv, domain); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -507,7 +516,12 @@ func (s *session) stepKeys(ctx context.Context, run *ops.Run) error {
 	// Keep keys from an earlier attempt: nothing has been told about them yet,
 	// but there is no reason to make new ones either.
 	if inbound == nil {
-		if inbound, err = xray.NewInbound(s.params.MaskHost); err != nil {
+		if s.params.Domain != "" {
+			inbound, err = xray.NewDomainInbound(s.params.Domain)
+		} else {
+			inbound, err = xray.NewInbound(s.params.MaskHost)
+		}
+		if err != nil {
 			return err
 		}
 		if err := s.inst.Servers.SetInbound(ctx, s.serverID, inbound); err != nil {
@@ -545,6 +559,9 @@ func (s *session) stepConfig(ctx context.Context, run *ops.Run) error {
 	s.plan = p
 	run.Detail(p.Template.Name + " v" + strconv.Itoa(p.Template.Latest.Version) + " · " + p.Inbound.MaskHost())
 	run.SetResult("mask_host", p.Inbound.MaskHost())
+	// What REALITY was pointed at, for the stub's step to know whether this
+	// file has to be written again if the domain is given up.
+	run.SetResult("domain", p.Inbound.Domain)
 	return nil
 }
 
@@ -561,14 +578,17 @@ func (s *session) stageConfig(ctx context.Context, run *ops.Run, p *plan.Plan) e
 	// clients included: a site the server cannot find means nothing connects.
 	// Said here, it is a clear message; left to the connection check, it is an
 	// unexplained EOF.
-	maskHost := p.Inbound.MaskHost()
-	if _, err := s.sudo(ctx, run, "getent hosts "+sshx.Quote(maskHost)); err != nil {
-		var exit *sshx.ExitError
-		if errors.As(err, &exit) {
-			return ops.Fail(CodeMaskUnreachable, maskHost+" does not resolve on the server",
-				map[string]any{"mask_host": maskHost})
+	// A server with its own domain borrows it from the stub site on its own
+	// loopback, which no resolver has a say in.
+	if maskHost := p.Inbound.MaskHost(); p.Inbound.Domain == "" {
+		if _, err := s.sudo(ctx, run, "getent hosts "+sshx.Quote(maskHost)); err != nil {
+			var exit *sshx.ExitError
+			if errors.As(err, &exit) {
+				return ops.Fail(CodeMaskUnreachable, maskHost+" does not resolve on the server",
+					map[string]any{"mask_host": maskHost})
+			}
+			return err
 		}
-		return err
 	}
 
 	run.Cmd("render config → " + candidatePath)
@@ -619,16 +639,8 @@ systemctl restart ` + xray.ServiceName
 
 	// A service that starts and dies a second later is "active" if asked at
 	// once. Wait out the first restart interval before believing it.
-	state, err := s.sudo(ctx, run, sshx.ServiceSettled(xray.ServiceName, settleSeconds))
-	if err != nil {
+	if err := s.xraySettled(ctx, run); err != nil {
 		return err
-	}
-	state = strings.TrimSpace(state)
-	if state != "active" {
-		journal, _ := s.quietSudo(ctx, "journalctl -u "+xray.ServiceName+" -n 20 --no-pager -o cat")
-		logOutput(run, journal)
-		return ops.Fail(CodeServiceFailed, xray.ServiceName+" is "+state,
-			map[string]any{"state": state, "output": strings.TrimSpace(journal)})
 	}
 	run.Detail(xray.ServiceName + " · active")
 	return nil
@@ -656,41 +668,80 @@ func (s *session) stepFirewall(ctx context.Context, run *ops.Run) error {
 		port = srv.Inbound.PortString()
 	}
 	rule := port + "/tcp"
+	firewall, err := s.openPortIn(ctx, run, rule)
+	if err != nil {
+		return err
+	}
+	if firewall == "" {
+		run.Detail(rule + " · no firewall")
+	} else {
+		run.Detail(rule + " · " + firewall)
+	}
+	return nil
+}
 
+// openPort lets a port through the server's firewall, if it has one the panel
+// manages.
+func (s *session) openPort(ctx context.Context, run *ops.Run, rule string) error {
+	_, err := s.openPortIn(ctx, run, rule)
+	return err
+}
+
+// openPortIn is openPort that also names the firewall it found: "ufw",
+// "nftables", or "" for none. rule is "443/tcp", built by the panel.
+func (s *session) openPortIn(ctx context.Context, run *ops.Run, rule string) (string, error) {
 	detect := `if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then echo ufw
 elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'hook input'; then echo nftables
 else echo none; fi`
 	out, err := s.quietSudo(ctx, detect)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	switch strings.TrimSpace(out) {
 	case "ufw":
 		existing, err := s.quietSudo(ctx, "ufw status | grep -E '^"+rule+" +ALLOW' || true")
 		if err != nil {
-			return err
+			return "", err
 		}
 		if strings.TrimSpace(existing) == "" {
 			if _, err := s.sudo(ctx, run, "ufw allow "+rule+" comment 'Xray Console'"); err != nil {
-				return err
+				return "", err
 			}
 			if err := s.addChange(ctx, changeFirewall, rule+" (ufw)"); err != nil {
-				return err
+				return "", err
 			}
 		} else {
-			run.Info("ufw already allows " + rule)
+			info(run, "ufw already allows "+rule)
 		}
-		run.Detail(rule + " · ufw")
+		return "ufw", nil
 	case "nftables":
 		// Hand-written rule sets are not edited: the panel cannot know where a
-		// rule belongs in someone else's chain. The connection check that
-		// follows will say whether the port is reachable.
-		run.Info("nftables rules found; the panel does not edit them. If " + rule + " is closed, the next step will say so")
-		run.Detail(rule + " · nftables")
-	default:
-		run.Info("no active firewall on the server; nothing to open")
-		run.Detail(rule + " · no firewall")
+		// rule belongs in someone else's chain. Whatever needs the port — the
+		// connection check, the certificate authority — will say whether it is
+		// reachable.
+		info(run, "nftables rules found; the panel does not edit them. If "+rule+" is closed, a later check will say so")
+		return "nftables", nil
+	}
+	info(run, "no active firewall on the server; nothing to open for "+rule)
+	return "", nil
+}
+
+// closePort takes back one rule the panel added, and only if it did.
+func (s *session) closePort(ctx context.Context, run *ops.Run, rule string) error {
+	srv, err := s.server(ctx)
+	if err != nil {
+		return err
+	}
+	change := servers.Change{Kind: changeFirewall, Text: rule + " (ufw)"}
+	for _, existing := range srv.Manifest {
+		if existing != change {
+			continue
+		}
+		if _, err := s.sudo(ctx, run, "ufw delete allow "+rule); err != nil {
+			return err
+		}
+		return s.inst.Servers.RemoveChange(ctx, s.serverID, change)
 	}
 	return nil
 }

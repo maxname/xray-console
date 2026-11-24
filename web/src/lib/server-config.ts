@@ -40,7 +40,11 @@ export function explain(
       const reason = String(error.details.reason ?? 'generic')
       return t(`fieldErrors.${reason}`, { defaultValue: t('fieldErrors.generic') })
     }
-    if (error.code === 'invalid_mask_host' || error.code === 'busy') {
+    if (
+      error.code === 'invalid_mask_host' ||
+      error.code === 'invalid_domain' ||
+      error.code === 'busy'
+    ) {
       return t(`fieldErrors.${error.code}`)
     }
     if (error.code === 'upstream_pending') {
@@ -58,6 +62,17 @@ export const APPLY_ERRORS = [
   'check_failed',
   'port_unreachable',
   'mask_unreachable',
+  // An apply that gives the server a domain sets up the stub site first.
+  'domain_unresolved',
+  'domain_mismatch',
+  'nginx_exists',
+  'port_in_use',
+  'packages_failed',
+  'acme_download_failed',
+  'cert_failed',
+  'cert_rate_limited',
+  'stub_failed',
+  'cert_invalid',
   'ssh_unreachable',
   'ssh_key_rejected',
   'ssh_host_key_changed',

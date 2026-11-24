@@ -25,7 +25,15 @@ const (
 	StepAccess = "access"
 )
 
-var uninstallOrder = []string{StepStop, StepFiles, StepPorts, StepAccess}
+// uninstallOrder is the steps of a removal; a server with a stub site has
+// that taken away too, after Xray — which was the one sending it visitors —
+// and before the ports are closed.
+func uninstallOrder(stub bool) []string {
+	if stub {
+		return []string{StepStop, StepFiles, StepSite, StepPorts, StepAccess}
+	}
+	return []string{StepStop, StepFiles, StepPorts, StepAccess}
+}
 
 // ErrNotUninstallable: the server has no Xray to remove, or is busy being
 // installed.
@@ -54,7 +62,8 @@ func (i *Installer) Uninstall(ctx context.Context, serverID int64, params Uninst
 	if i.Ops.Busy(serverID) {
 		return nil, ops.ErrBusy
 	}
-	op, err := i.Ops.Create(ctx, serverID, KindUninstall, uninstallOrder, params)
+	stub := hasChange(srv, changeSite) || hasChange(srv, changePackages)
+	op, err := i.Ops.Create(ctx, serverID, KindUninstall, uninstallOrder(stub), params)
 	if err != nil {
 		return nil, err
 	}
@@ -83,11 +92,20 @@ func (i *Installer) RetryUninstall(ctx context.Context, operationID int64) error
 
 func (i *Installer) runUninstall(ctx context.Context, op *ops.Operation, params UninstallParams) error {
 	s := &session{inst: i, serverID: op.ServerID, uninstall: params}
-	steps := []ops.Step{
-		{ID: StepStop, Run: s.uninstallStop},
-		{ID: StepFiles, Run: s.uninstallFiles},
-		{ID: StepPorts, Run: s.uninstallPorts},
-		{ID: StepAccess, Run: s.uninstallAccess},
+	known := map[string]ops.Step{
+		StepStop:   {Run: s.uninstallStop},
+		StepFiles:  {Run: s.uninstallFiles},
+		StepSite:   {Run: s.uninstallSite},
+		StepPorts:  {Run: s.uninstallPorts},
+		StepAccess: {Run: s.uninstallAccess},
+	}
+	// As the job has them: one that was started for a server with a stub site
+	// keeps that step when it is resumed.
+	steps := make([]ops.Step, 0, len(op.Steps))
+	for _, state := range op.Steps {
+		step := known[state.ID]
+		step.ID = state.ID
+		steps = append(steps, step)
 	}
 	return i.launch(ctx, op.ServerID, servers.StatusUninstalling, func() error {
 		return i.Ops.Execute(op.ID, steps, s.finishUninstall)
@@ -122,6 +140,16 @@ func (s *session) uninstallFiles(ctx context.Context, run *ops.Run) error {
 		run.SetResult("backups", BackupDir)
 	}
 	run.Detail("Xray and its configuration")
+	return nil
+}
+
+// uninstallSite takes away the stub site: its files, its certificate, the
+// timer that renews it and the nginx the panel installed for it.
+func (s *session) uninstallSite(ctx context.Context, run *ops.Run) error {
+	if err := s.undoSite(ctx, run); err != nil {
+		return err
+	}
+	run.Detail("nginx · the stub site · its certificate")
 	return nil
 }
 

@@ -58,11 +58,16 @@ type Inbound struct {
 	// Dest is where REALITY sends anyone who is not a client: "host:port".
 	Dest        string   `json:"dest"`
 	ServerNames []string `json:"server_names"`
-	PrivateKey  string   `json:"private_key"`
-	PublicKey   string   `json:"public_key"`
-	ShortIDs    []string `json:"short_ids"`
-	XHTTPPath   string   `json:"xhttp_path"`
-	XHTTPMode   string   `json:"xhttp_mode"`
+	// Domain is the server's own domain when it masquerades as itself: a stub
+	// site on the server answers for it, Dest is that site (StubListen) and
+	// ServerNames holds the domain. Empty for a server that passes itself off
+	// as someone else's site.
+	Domain     string   `json:"domain,omitempty"`
+	PrivateKey string   `json:"private_key"`
+	PublicKey  string   `json:"public_key"`
+	ShortIDs   []string `json:"short_ids"`
+	XHTTPPath  string   `json:"xhttp_path"`
+	XHTTPMode  string   `json:"xhttp_mode"`
 	// XHTTPPadding is the xPaddingBytes range, "100-1000"; empty leaves
 	// Xray's default.
 	XHTTPPadding string `json:"xhttp_padding,omitempty"`
@@ -99,7 +104,7 @@ func (in *Inbound) MaskHost() string {
 	return in.ServerNames[0]
 }
 
-// SetMaskHost changes the masking site.
+// SetMaskHost makes the server pass itself off as someone else's site.
 func (in *Inbound) SetMaskHost(raw string) error {
 	host, err := NormalizeMaskHost(raw)
 	if err != nil {
@@ -107,6 +112,41 @@ func (in *Inbound) SetMaskHost(raw string) error {
 	}
 	in.Dest = net.JoinHostPort(host, "443")
 	in.ServerNames = []string{host}
+	in.Domain = ""
+	return nil
+}
+
+// StubListen is where the stub site of a server with its own domain answers
+// over TLS: the server's loopback, so that only REALITY — which hands it
+// everyone who is not a client — ever reaches it.
+const StubListen = "127.0.0.1:8443"
+
+// StubPort is the port of StubListen.
+const StubPort = 8443
+
+// ErrInvalidDomain: not a name a certificate can be issued for.
+var ErrInvalidDomain = errors.New("domain must be a host name such as cdn.example.com")
+
+// NormalizeDomain accepts a server's own domain as a person types it and
+// returns the bare lower-case name.
+func NormalizeDomain(raw string) (string, error) {
+	host, err := NormalizeMaskHost(raw)
+	if err != nil {
+		return "", ErrInvalidDomain
+	}
+	return host, nil
+}
+
+// SetDomain makes the server masquerade as its own domain: REALITY hands
+// strangers to the stub site on the server itself.
+func (in *Inbound) SetDomain(raw string) error {
+	domain, err := NormalizeDomain(raw)
+	if err != nil {
+		return err
+	}
+	in.Dest = StubListen
+	in.ServerNames = []string{domain}
+	in.Domain = domain
 	return nil
 }
 
@@ -169,8 +209,24 @@ func (in *Inbound) RemoveShortID(id string) error {
 // NewInbound makes fresh settings for a server that masquerades as someone
 // else's site.
 func NewInbound(maskHost string) (*Inbound, error) {
-	maskHost, err := NormalizeMaskHost(maskHost)
-	if err != nil {
+	return newInbound(func(in *Inbound) error { return in.SetMaskHost(maskHost) })
+}
+
+// NewDomainInbound makes fresh settings for a server that masquerades as its
+// own domain, with a stub site on the server answering for it.
+func NewDomainInbound(domain string) (*Inbound, error) {
+	return newInbound(func(in *Inbound) error { return in.SetDomain(domain) })
+}
+
+// newInbound makes the keys and lets mask say what the server passes itself
+// off as. The name is checked first: a bad one costs no keys.
+func newInbound(mask func(*Inbound) error) (*Inbound, error) {
+	inbound := &Inbound{
+		Port:      DefaultPort,
+		XHTTPPath: DefaultXHTTPPath,
+		XHTTPMode: DefaultXHTTPMode,
+	}
+	if err := mask(inbound); err != nil {
 		return nil, err
 	}
 	private, public, err := NewRealityKeys()
@@ -189,17 +245,10 @@ func NewInbound(maskHost string) (*Inbound, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Inbound{
-		Port:        DefaultPort,
-		Dest:        net.JoinHostPort(maskHost, "443"),
-		ServerNames: []string{maskHost},
-		PrivateKey:  private,
-		PublicKey:   public,
-		ShortIDs:    []string{first, second},
-		XHTTPPath:   DefaultXHTTPPath,
-		XHTTPMode:   DefaultXHTTPMode,
-		CheckUUID:   uuid,
-	}, nil
+	inbound.PrivateKey, inbound.PublicKey = private, public
+	inbound.ShortIDs = []string{first, second}
+	inbound.CheckUUID = uuid
+	return inbound, nil
 }
 
 var ErrInvalidMaskHost = errors.New("masking site must be a domain name such as www.example.com")

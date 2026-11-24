@@ -21,8 +21,10 @@ import (
 
 	"golang.org/x/term"
 
+	"xray-console/internal/acmesh"
 	"xray-console/internal/alerts"
 	"xray-console/internal/auth"
+	"xray-console/internal/certs"
 	"xray-console/internal/chains"
 	"xray-console/internal/config"
 	"xray-console/internal/devices"
@@ -245,10 +247,17 @@ func runServe(args []string) error {
 		Busy: manager.Busy, Interval: *trafficInterval, Log: logger,
 	}
 	installer.RecordTraffic = collector.Record
+	// Servers that masquerade as their own domain: acme.sh for them comes
+	// through the panel, like Xray, and what certificate each one shows is
+	// looked at from outside.
+	installer.UseACMEScript(acmesh.New(filepath.Join(cfg.DataDir, "cache", "acme")).Fetch)
+	certStore := certs.NewStore(db)
+	certWatcher := certs.NewWatcher(serverStore, certStore, eventStore, logger)
+	installer.CertChanged = certWatcher.Refresh
 	alertStore := alerts.NewStore(db, box)
 	notifier := &alerts.Notifier{
 		Store: alertStore, Servers: serverStore, State: probeStore.StateOf,
-		Latest: installer.Latest, Outdated: installer.Outdated,
+		Latest: installer.Latest, Outdated: installer.Outdated, Certs: certStore,
 		Client: &http.Client{Timeout: 20 * time.Second}, Log: logger,
 	}
 	// Clients the panel sets up itself: devices over SSH, and one inside the
@@ -301,6 +310,7 @@ func runServe(args []string) error {
 			Traffic:        trafficStore,
 			Alerts:         alertStore,
 			Notifier:       notifier,
+			Certs:          certStore,
 			Devices:        deviceManager,
 			Local:          localClient,
 			Ops:            manager,
@@ -357,6 +367,7 @@ func runServe(args []string) error {
 	alongside(func() { sweeper.Run(jobsCtx) })
 	alongside(func() { collector.Run(jobsCtx) })
 	alongside(func() { notifier.Run(jobsCtx) })
+	alongside(func() { certWatcher.Run(jobsCtx) })
 	alongside(func() { deviceManager.Run(jobsCtx, time.Minute) })
 	alongside(func() { localClient.Run(jobsCtx) })
 

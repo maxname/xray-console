@@ -49,8 +49,8 @@ left is in the "Not built yet" notes below.
   addresses through it. The panel writes no rule for that: Xray's `freedom`
   outbound refuses them to proxied clients by itself. `make integration`
   checks that the release on the node still does.
-- An installation is an operation of eight steps (`internal/install`), each
-  resumable and undoable. A failure pauses it; the administrator retries from
+- An installation is an operation of eight steps (`internal/install`) — nine
+  for a server with its own domain, see below — each resumable and undoable. A failure pauses it; the administrator retries from
   that step or rolls everything back. Everything changed on the server is
   recorded in the server's manifest.
 - The connection check starts a throwaway Xray client on the server and sends
@@ -59,6 +59,85 @@ left is in the "Not built yet" notes below.
 - Deleting a server from the panel leaves Xray running but takes the panel's
   key off the server and turns password login back on if the panel turned it
   off.
+
+## How masking with the server's own domain works
+
+- A server masquerades either as someone else's site (`Inbound.SetMaskHost`)
+  or as its own domain (`Inbound.SetDomain`, `Inbound.Domain`): a choice per
+  server, at installation and afterwards. With its own domain REALITY's
+  `dest` is a stub site on the server's loopback (`xray.StubListen`,
+  127.0.0.1:8443) and `serverNames` is the domain; strangers who come to 443
+  are handed to the stub and see a real certificate for the name.
+- The stub (`internal/install/site.go`) is nginx from the distribution's
+  packages — TLS on the loopback, port 80 for the certificate authority's
+  HTTP-01 check and a redirect — one built-in page that says nothing about
+  what the server is for, and a Let's Encrypt certificate that acme.sh
+  obtains. It has places of its own (`/usr/local/lib/xray-console-site`,
+  `/usr/local/etc/xray-console-site`, `/var/www/xray-console-site`,
+  `/etc/nginx/conf.d/xray-console-site.conf`) and its own manifest kinds,
+  `packages` and `site`.
+- acme.sh reaches a server the way Xray does (`internal/acmesh`): the panel
+  downloads one pinned release, checks it against a SHA-256 that is part of
+  the panel's code, and uploads it. A newer acme.sh comes with a newer panel.
+  It is run in place, never installed: renewal is a systemd timer the panel
+  writes (`xray-console-site-renew.timer`, daily), and nginx is reloaded by
+  the command acme.sh keeps with the certificate.
+- The stub is never set up next to what is someone else's. A busy port 80 or
+  8443, or an nginx the panel did not install, stops the job before anything
+  is changed (`sitePreflight`: `port_in_use`, `nginx_exists`), and so does a
+  domain that does not lead to the server and nowhere else
+  (`domainPointsHere`: the panel resolves the name and compares it with the
+  server's address and the addresses on its interfaces). An installation asks
+  in its system step; an apply, at the start of its stub step.
+- Which nginx packages the panel installed is worked out on the server, by
+  comparing with the list of packages taken before (`listPackages`), and only
+  those are ever purged. curl, openssl and ca-certificates, if apt added
+  them, stay.
+- An installation with a domain has the step `site` between the firewall and
+  the connection check; port 80 is the stub's and is opened and closed by its
+  step. When that step — or the checks before it — fail, the installation can
+  be gone on with without the domain (`Installer.WithoutDomain`): the job's
+  params and the server's inbound are changed to someone else's site, and the
+  stub's own step takes away what was set up and gives Xray a configuration
+  that no longer points at it.
+- The domain is part of the plan (`reality.domain`), so giving a server a
+  domain, moving it to another or giving it up are changes to apply. An apply
+  that sets or changes the domain has `site` as its first step: the stub has
+  to answer for the new name before Xray is pointed at it. If anything after
+  that fails, the configuration goes back first and the stub after it
+  (`session.restore`), and `restored` covers both. A domain that is given up
+  needs no step: the stub goes once the new settings have passed their check
+  (`settleSite`), and what could not be removed stays in the manifest for the
+  next apply or the removal of Xray. An update of Xray does not touch the stub.
+- Removing Xray from such a server has a step `site` too, after Xray's files
+  and before the ports. Deleting the server from the panel leaves the stub
+  and its timer running with Xray.
+- What certificate each server shows is looked at from outside
+  (`internal/certs`): once an hour, and at once after an installation, an
+  apply or a renewal, the panel connects to port 443 asking for the domain
+  and reads the certificate's dates — no SSH involved, and what it sees is
+  what a visitor sees. The overview's tile shows the one that runs out
+  first; a later end for the same name is the event `cert_renewed`.
+- A certificate is overdue (`certs.State.Overdue`) when less than 20 days of
+  it are left, or a quarter of its life if that is shorter: acme.sh renews
+  long before. An overdue one is told once per certificate
+  (`alerts.KindCertNotRenewed`, the `on_cert` switch).
+- "Renew now" (`Installer.RenewCert`) runs acme.sh with `--force` over SSH, a
+  one-off command like a restart; the authority's refusals come back as
+  `cert_failed` or `cert_rate_limited`.
+- The certificate authority is Let's Encrypt. Only tests name another
+  (`Installer.UseACME`): `make integration-domain` runs the whole thing
+  against Pebble on a Docker network of its own.
+
+Not built yet from the masking designs: a site of one's own from an archive
+and a mirror of another site as the stub's content (every stub shows the same
+page, which is something an active prober could learn to recognise), adding
+the stub to an nginx that is already on the server, choices when port 80 is
+busy, any check other than HTTP-01, a way to remove a stub that an apply left
+behind other than applying again or removing Xray, the mail address for the
+authority's notices (Let's Encrypt no longer sends them), the log of issues,
+choosing how long before its end a certificate is renewed, setting the XHTTP
+Host from the domain (it stays a template field).
 
 ## How settings work
 
@@ -201,8 +280,7 @@ Not built yet from the update and uninstall designs: moving traffic off a
 server before touching it and waiting for open connections to end (Xray's own
 balancer notices the restart; a server alone in its link is briefly down),
 skipping servers that are the only exit of a chain, choosing a release other
-than the newest, the stub site and certificate step (there is no stub site
-yet), a list of commands to finish a removal by hand.
+than the newest, a list of commands to finish a removal by hand.
 
 ## How statistics and alerts work
 
@@ -249,8 +327,8 @@ yet), a list of commands to finish a removal by hand.
 Not built yet from the statistics and alerts designs: checks from other
 vantage points (an entry node, clients), mail as a channel (the panel has no
 mail server settings), alerts about a chain going to its reserve (Xray
-decides that on the server and does not say), certificate renewal and
-subscription limits (neither exists), keeping a removed server's statistics,
+decides that on the server and does not say), subscription limits (there
+are none), keeping a removed server's statistics,
 per-chain traffic, the checks' settings screen.
 
 ## How devices and the local client work
@@ -325,17 +403,15 @@ a group as the entry, a link to hand to a client (that is subscriptions).
 
 Not built yet from the checks designs: the settings screen (interval and URL
 are the `--check-interval` and `--check-url` flags), a per-server switch,
-checks from other vantage points, speed measurement, the certificate tile on
-the overview.
+checks from other vantage points, speed measurement.
 
 Not built yet from the settings designs: arbitrary template variables (the
 field list is fixed in code), changing the port, xmux and split channels
 (client-side settings — they arrive with clients), node roles, keeping old
 keys for 24 hours on rotation, inbound users.
 
-Not built yet from the install designs: masking with the server's own domain
-(nginx stub, acme.sh), taking over an existing Xray, choices when port 443 is
-busy, editing nftables rules, automatic reconnect during an installation,
+Not built yet from the install designs: taking over an existing Xray, choices
+when port 443 is busy, editing nftables rules, automatic reconnect during an installation,
 importing other SSH keys.
 
 ## Layout
@@ -356,7 +432,11 @@ importing other SSH keys.
   a server or on a device; one job at a time on each.
   Finished jobs older than 90 days are pruned, except each server's latest.
 - `internal/install` — the installation steps, applying settings, the
-  connection check, updating Xray, removing it.
+  connection check, updating Xray, removing it, the stub site of a server
+  with its own domain.
+- `internal/acmesh` — the pinned acme.sh the panel downloads and checks.
+- `internal/certs` — the certificates servers with their own domain show, as
+  seen from outside.
 - `internal/templates` — templates, their fields and versions.
 - `internal/plan` — a server's desired configuration and its diff from the
   applied one.
@@ -396,6 +476,10 @@ importing other SSH keys.
   update from an older release and one that fails, removal.
 - `make integration-chain` — three nodes: a chain with a balanced group,
   failover and recovery, then subscriptions and rules on its entry.
+- `make integration-domain` — a node and Pebble (a test certificate
+  authority) on a Docker network of their own (`test/domain`): a server with
+  its own domain installed, moved to another, given the domain up, a
+  certificate that is refused, renewal, removal.
 - Frontend only: `cd web && pnpm dev` (proxies `/api` to 127.0.0.1:8080).
 
 ## Conventions
@@ -453,6 +537,9 @@ importing other SSH keys.
   that is not there and fails as told. A change to apply, update or their
   restore paths comes with a test there; the Docker tests cover the path
   where everything works.
+- A step of an operation is looked up by the ids the job was created with
+  (`session.steps`, `runUninstall`), not rebuilt from what the server looks
+  like now: a job that began with a stub site keeps that step when resumed.
 - A taken name is recognised with `store.IsUnique`, by the database's result
   code, never by the words of its message.
 - Anything written to a shell command is either validated to a strict shape

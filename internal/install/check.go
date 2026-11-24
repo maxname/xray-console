@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -95,13 +96,24 @@ func (s *session) verify(ctx context.Context, run *ops.Run, inbound *xray.Inboun
 	address := net.JoinHostPort(srv.Host, inbound.PortString())
 	maskHost := inbound.MaskHost()
 	run.Cmd("tls handshake " + address + " (sni " + maskHost + ")")
-	elapsed, err := handshake(ctx, address, maskHost)
+	// A server with its own domain shows a certificate the panel's authority
+	// issued; any other, whatever the site it borrows shows.
+	var roots *x509.CertPool
+	if inbound.Domain != "" {
+		roots = s.inst.acme.Roots
+	}
+	elapsed, err := handshake(ctx, address, maskHost, roots)
 	if err != nil {
 		var netErr net.Error
 		var opErr *net.OpError
 		if errors.As(err, &opErr) && opErr.Op == "dial" || errors.As(err, &netErr) && netErr.Timeout() {
 			return ops.Fail(CodePortUnreachable, err.Error(),
 				map[string]any{"address": address, "port": inbound.Port})
+		}
+		if inbound.Domain != "" {
+			// Strangers are handed to the stub site, and what it showed is
+			// not a certificate a browser would take for this name.
+			return ops.Fail(CodeCertInvalid, err.Error(), map[string]any{"domain": inbound.Domain})
 		}
 		return ops.Fail(CodeMaskUnreachable, err.Error(), map[string]any{"mask_host": maskHost})
 	}
@@ -346,8 +358,9 @@ func socksConnect(conn io.ReadWriter, host string, port uint16, auth *SOCKSAuth)
 }
 
 // handshake completes a TLS handshake with address as an outsider would,
-// asking for serverName, and reports how long it took.
-func handshake(ctx context.Context, address, serverName string) (time.Duration, error) {
+// asking for serverName, and reports how long it took. roots is what the
+// certificate is checked against; nil is the system's.
+func handshake(ctx context.Context, address, serverName string, roots *x509.CertPool) (time.Duration, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -359,7 +372,7 @@ func handshake(ctx context.Context, address, serverName string) (time.Duration, 
 	defer conn.Close()
 
 	start := time.Now()
-	secured := tls.Client(conn, &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS13})
+	secured := tls.Client(conn, &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS13, RootCAs: roots})
 	if err := secured.HandshakeContext(ctx); err != nil {
 		return 0, fmt.Errorf("TLS handshake as %s: %w", serverName, err)
 	}

@@ -32,6 +32,9 @@ type Settings struct {
 	OnDown   bool `json:"on_down"`
 	OnUp     bool `json:"on_up"`
 	OnUpdate bool `json:"on_update"`
+	// OnCert: the certificate of a server's own domain was not renewed when
+	// it should have been.
+	OnCert bool `json:"on_cert"`
 
 	// DownAfterMinutes is how long a server has to be unreachable before it
 	// is worth a message. An outage shorter than this is never mentioned,
@@ -48,7 +51,7 @@ type Settings struct {
 // Defaults is what a panel that was never configured has: everything worth
 // knowing switched on, nowhere to send it.
 func Defaults() Settings {
-	return Settings{Enabled: true, OnDown: true, OnUp: true, OnUpdate: true, DownAfterMinutes: 3}
+	return Settings{Enabled: true, OnDown: true, OnUp: true, OnUpdate: true, OnCert: true, DownAfterMinutes: 3}
 }
 
 // HasTelegram and HasWebhook report whether a channel is set up.

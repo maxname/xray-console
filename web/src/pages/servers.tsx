@@ -141,7 +141,15 @@ function ServerRow({ server }: { server: Server }) {
       <TableCell>
         <TemplateCell server={server} />
       </TableCell>
-      <TableCell className="font-mono">{server.inbound?.mask_host ?? '—'}</TableCell>
+      <TableCell className="font-mono">
+        {server.inbound?.mask_host ?? '—'}
+        {server.inbound && server.inbound.domain !== '' && (
+          <span className="font-sans text-xs text-muted-foreground">
+            {' · '}
+            {t('servers.ownDomain')}
+          </span>
+        )}
+      </TableCell>
       <TableCell className="text-right">
         <Button asChild variant="outline" size="sm">
           <Link to="/servers/$serverId" params={{ serverId: String(server.id) }}>

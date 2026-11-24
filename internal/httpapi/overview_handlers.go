@@ -86,6 +86,15 @@ type overviewJSON struct {
 	Traffic  []traffic.Day  `json:"traffic"`
 	Counting int            `json:"counting"`
 	Events   []events.Event `json:"events"`
+	// Certs is the certificates of servers with their own domain, the one
+	// that runs out first at the top; empty when no server has a domain.
+	Certs []overviewCertJSON `json:"certs"`
+}
+
+type overviewCertJSON struct {
+	ServerID   int64  `json:"server_id"`
+	ServerName string `json:"server_name"`
+	certJSON
 }
 
 func (s *Server) overview(ctx context.Context) (*overviewJSON, error) {
@@ -152,6 +161,33 @@ func (s *Server) overview(ctx context.Context) (*overviewJSON, error) {
 	}
 	if view.Events, err = s.events.Recent(ctx, 20); err != nil {
 		return nil, err
+	}
+
+	names := map[int64]string{}
+	for _, srv := range all {
+		names[srv.ID] = srv.Name
+	}
+	known, err := s.certs.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	view.Certs = []overviewCertJSON{}
+	for _, cert := range known {
+		// One that has never been read sorts first by its date and says
+		// nothing about what runs out when: it goes last.
+		if cert.NotAfter.IsZero() {
+			continue
+		}
+		view.Certs = append(view.Certs, overviewCertJSON{
+			ServerID: cert.ServerID, ServerName: names[cert.ServerID], certJSON: *certView(&cert, now),
+		})
+	}
+	for _, cert := range known {
+		if cert.NotAfter.IsZero() {
+			view.Certs = append(view.Certs, overviewCertJSON{
+				ServerID: cert.ServerID, ServerName: names[cert.ServerID], certJSON: *certView(&cert, now),
+			})
+		}
 	}
 	return &view, nil
 }

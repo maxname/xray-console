@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build web test node integration integration-chain run release clean
+.PHONY: build web test node integration integration-chain integration-domain run release clean
 
 # One binary with the web interface inside.
 build: web
@@ -37,6 +37,14 @@ integration-chain:
 	./test/node/run.sh xc-node-3
 	XC_TEST_NODES=$$(./test/node/address.sh xc-node-1),$$(./test/node/address.sh xc-node-2),$$(./test/node/address.sh xc-node-3) \
 		go test -tags integration -count=1 -timeout 900s -run Chain ./internal/install/
+
+# A server that masquerades as its own domain: a node and Pebble — Let's
+# Encrypt's test certificate authority — on a Docker network of their own, so
+# the stub site and its certificate are set up for real without a real domain.
+integration-domain:
+	./test/domain/run.sh
+	env $$(./test/domain/env.sh) \
+		go test -tags integration -count=1 -timeout 1500s -run OwnDomain ./internal/install/
 
 run: build
 	./bin/xray-console serve --data ./data

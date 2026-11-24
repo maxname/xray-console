@@ -73,18 +73,35 @@ func (i *Installer) Apply(ctx context.Context, serverID int64) (*ops.Operation, 
 			return nil, &AwaitingError{Servers: first}
 		}
 	}
-	op, err := i.Ops.Create(ctx, serverID, KindApply, applyOrder, map[string]any{})
-	if err != nil {
-		return nil, err
-	}
 	s := &session{inst: i, serverID: serverID}
+	order := applyOrder
 	steps := []ops.Step{
 		{ID: StepStage, Run: s.applyStage},
 		{ID: StepSwap, Run: s.applySwap},
 		{ID: StepVerify, Run: s.applyVerify},
 	}
+	// A server that is given a domain of its own, or another one, needs the
+	// stub site to answer for it before Xray is pointed there: that is a step
+	// of its own, and the first. Giving the domain up needs nothing before —
+	// the stub goes once the new settings have passed their check.
+	running := ""
+	if srv.Applied != nil && srv.Applied.Inbound != nil {
+		running = srv.Applied.Inbound.Domain
+	}
+	if wanted := desired.Inbound.Domain; wanted != running {
+		s.site = &siteChange{from: running, to: wanted}
+		if wanted != "" {
+			order = append([]string{StepSite}, applyOrder...)
+			steps = append([]ops.Step{{ID: StepSite, Run: s.applySite, Timeout: siteTimeout}}, steps...)
+		}
+	}
+	op, err := i.Ops.Create(ctx, serverID, KindApply, order, map[string]any{})
+	if err != nil {
+		return nil, err
+	}
 	finish := func(done *ops.Operation) {
 		s.close()
+		i.certChanged(serverID)
 		if done.Status == ops.StatusSucceeded {
 			i.Events.Add(events.ConfigApplied, srv.ID, srv.Name, map[string]any{"changed": done.Result["changed"]})
 			return
@@ -117,8 +134,9 @@ func (s *session) applyStage(ctx context.Context, run *ops.Run) error {
 	run.Info("changed: " + strings.Join(changed, ", "))
 	run.SetResult("changed", changed)
 	if err := s.stageConfig(ctx, run, p); err != nil {
-		// Nothing on the server was touched.
-		return withRestored(err, true)
+		// Xray's configuration was not touched; a stub site that was set up
+		// for it a step ago was, and goes back.
+		return withRestored(err, s.restore(ctx, run))
 	}
 	s.plan = p
 	run.Detail(p.Template.Name + " v" + strconv.Itoa(p.Template.Latest.Version))
@@ -164,12 +182,25 @@ func (s *session) applyVerify(ctx context.Context, run *ops.Run) error {
 	if err := s.verify(ctx, run, s.plan.Inbound); err != nil {
 		return withRestored(err, s.restore(ctx, run))
 	}
-	return s.recordApplied(ctx, s.plan)
+	if err := s.recordApplied(ctx, s.plan); err != nil {
+		return err
+	}
+	s.settleSite(ctx, run)
+	return nil
 }
 
-// restore puts back the configuration the swap replaced and restarts Xray. It
-// reports whether that worked.
+// restore puts the server back as the apply found it: the configuration the
+// swap replaced, with Xray restarted, and then the stub site if this apply
+// changed it — in that order, so that Xray is never left pointing at a stub
+// that has just been taken away. It reports whether all of that worked.
 func (s *session) restore(ctx context.Context, run *ops.Run) bool {
+	restored := s.restoreConfig(ctx, run)
+	return s.revertSite(ctx, run) && restored
+}
+
+// restoreConfig puts back the configuration the swap replaced and restarts
+// Xray. It reports whether that worked.
+func (s *session) restoreConfig(ctx context.Context, run *ops.Run) bool {
 	if s.backup == "" {
 		return true
 	}

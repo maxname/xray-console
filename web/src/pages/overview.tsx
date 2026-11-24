@@ -12,12 +12,20 @@ import { Skeleton } from '@/components/ui/skeleton'
 import {
   api,
   type Overview,
+  type OverviewCert,
   type OverviewServer,
   type PanelEvent,
 } from '@/lib/api'
 import { type Translate } from '@/lib/errors'
 import { aftermath } from '@/lib/failures'
-import { formatBytes, formatDayTime, formatDuration, formatPercent } from '@/lib/format'
+import { daysLeft } from '@/lib/domain'
+import {
+  formatBytes,
+  formatDate,
+  formatDayTime,
+  formatDuration,
+  formatPercent,
+} from '@/lib/format'
 import { useMe } from '@/lib/use-me'
 import { useNow } from '@/lib/use-now'
 import { cn } from '@/lib/utils'
@@ -116,10 +124,18 @@ export function OverviewPage() {
         </Panel>
       ) : (
         <>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <div
+            className={cn(
+              'grid gap-4 sm:grid-cols-2',
+              // The certificate's tile is there only when some server has a
+              // domain of its own.
+              overview.certs.length > 0 ? 'xl:grid-cols-4' : 'xl:grid-cols-3',
+            )}
+          >
             <OnlineTile overview={overview} down={down} />
             <TrafficTile overview={overview} />
             <LatencyTile overview={overview} />
+            {overview.certs.length > 0 && <CertTile certs={overview.certs} />}
           </div>
           <Panel>
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -292,6 +308,39 @@ function LatencyTile({ overview }: { overview: Overview }) {
   )
 }
 
+/** The certificate that runs out first, among servers with their own domain. */
+function CertTile({ certs }: { certs: OverviewCert[] }) {
+  const { t } = useTranslation()
+  const now = useNow()
+  // The list comes with the nearest end first, and those never read last.
+  const nearest = certs[0]
+  const left = daysLeft(nearest, now)
+  const where = { domain: nearest.domain, name: nearest.server_name }
+  if (nearest.not_after === null || left === null) {
+    return (
+      <StatTile
+        label={t('overview.tiles.cert')}
+        value={t('overview.tiles.certUnread')}
+        note={t('overview.tiles.certUnreadNote', where)}
+      />
+    )
+  }
+  const until = { ...where, date: formatDate(nearest.not_after) }
+  return (
+    <StatTile
+      label={t('overview.tiles.cert')}
+      value={
+        left < 0 ? t('overview.tiles.certExpired') : t('overview.tiles.certDays', { count: left })
+      }
+      note={
+        nearest.overdue
+          ? t('overview.tiles.certOverdue', until)
+          : t('overview.tiles.certNote', until)
+      }
+    />
+  )
+}
+
 function AvailabilityRow({ server }: { server: OverviewServer }) {
   const { t } = useTranslation()
   const percent = server.uptime_percent
@@ -384,6 +433,12 @@ function describeEvent(t: Translate, event: PanelEvent): string {
       }
       return t(`overview.events.update_failed.${aftermath(data)}`, versions)
     }
+    case 'cert_renewed':
+      return t('overview.events.cert_renewed', {
+        name,
+        domain: typeof data.domain === 'string' ? data.domain : '',
+        date: typeof data.not_after === 'number' ? formatDate(data.not_after) : '',
+      })
     default:
       return t(`overview.events.${event.kind}`, { name })
   }

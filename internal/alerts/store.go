@@ -13,7 +13,10 @@ const (
 	KindServerDown      = "server_down"
 	KindServerUp        = "server_up"
 	KindUpdateAvailable = "update_available"
-	KindTest            = "test"
+	// KindCertNotRenewed: a server's certificate is close to its end, or past
+	// it, and the renewal on the server has not happened.
+	KindCertNotRenewed = "cert_not_renewed"
+	KindTest           = "test"
 )
 
 // Message is one thing to tell: the facts for a program, the sentence for a
