@@ -164,9 +164,9 @@ and down buttons), a rule set made as a copy of another, updating geosite and
 geoip lists (they are the ones installed with Xray), "local addresses direct"
 (rules run on the server, where that has no meaning), limits and device counts
 (decided against), choosing which chains a subscription may use, adding users
-without restarting Xray, a subscription over several entry servers, this
-computer and remote devices as clients (the last stage). The `vless://` link
-follows the XTLS share-link proposal and has not been tried in client apps.
+without restarting Xray, a subscription over several entry servers. The `vless://` link
+follows the XTLS share-link proposal; it connected in one client app on a real
+server, and other apps have not been tried.
 
 ## How updating and removing Xray work
 

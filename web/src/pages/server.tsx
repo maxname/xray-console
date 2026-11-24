@@ -279,8 +279,13 @@ export function FreshView({
 }) {
   const { t } = useTranslation()
   const refresh = useRefreshServer(server)
+  // What was chosen last time is the likeliest choice now: a server added
+  // with the panel's key already on it is not asked for a password again.
   const [install, setInstall] = useState(() => ({
     ...initialInstallForm,
+    auth: lastOperation?.params.auth ?? initialInstallForm.auth,
+    disablePasswordLogin:
+      lastOperation?.params.disable_password_login ?? initialInstallForm.disablePasswordLogin,
     maskHost: lastOperation?.params.mask_host ?? '',
   }))
   const [deleting, setDeleting] = useState(false)

@@ -8,3 +8,5 @@
 /internal/webui/dist/*
 !/internal/webui/dist/.gitkeep
 .DS_Store
+# Worktrees of other Claude sessions on this repository.
+/.claude/worktrees/

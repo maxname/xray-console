@@ -690,7 +690,7 @@ else echo none; fi`
 		run.Detail(rule + " · nftables")
 	default:
 		run.Info("no active firewall on the server; nothing to open")
-		run.Detail(rule)
+		run.Detail(rule + " · no firewall")
 	}
 	return nil
 }
